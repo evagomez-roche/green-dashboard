@@ -464,6 +464,14 @@ with tab_drilldown:
     selected_proj_drill = st.selectbox("Select a project to analyze:", options=filtered_df['Project'].unique())
     
     if selected_proj_drill:
+
+        if selected_proj_drill == "Archimedes Lever":
+            st.warning(
+                "**Proxy Model Estimation (Archimedes Lever):**\n\n"
+                "The baseline telemetry for this project was originally recorded using Anthropic's 'Opus 5'. "
+                "Since this specific model version is not yet supported by standard carbon tracking APIs, "
+                "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model."
+            )
         df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
         is_ai_proj = df_proj['IS_AI'].iloc[0] == 1 if not df_proj.empty else False
         
