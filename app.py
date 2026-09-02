@@ -8,7 +8,7 @@ import numpy as np
 import re
 
 # =====================================================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & KNOWN METADATA
 # =====================================================================
 st.set_page_config(
     page_title="SCI Carbon Dashboard",
@@ -16,6 +16,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Manual fallback for measurement periods until integrated into the SQLite schema
+KNOWN_PERIODS = {
+    "Galileo": "Unknown (Jan 1st, 2025 - Aug 5th, 2026)",
+    "myCO2": "1 Hour (Frontend/API) - Pending DWH merge",
+    "Archimedes Lever": "Unknown",
+    "ris-ase-fp-analyzer": "5 Minutes (Automated Assessment)"
+}
+
+# Custom Color Palettes for High Contrast Bar Charts
+DARK_PURPLES = ['#4A235A', '#5B2C6F', '#6C3483', '#7D3C98', '#8E44AD', '#9B59B6', '#AF7AC5', '#C39BD3', '#D2B4DE', '#E8DAEF']
+DARK_BLUES = ['#154360', '#1A5276', '#1F618D', '#2471A3', '#2980B9', '#5499C7', '#7FB3D5', '#A9CCE3', '#D4E6F1', '#EAF2F8']
 
 # Custom CSS styles for metrics
 st.markdown('''
@@ -57,61 +69,80 @@ st.title("🌱 Software Carbon Intensity (SCI) Dashboard")
 st.caption("Green Software Foundation Telemetry & Real-Time Analytics")
 
 # =====================================================================
-# FORMATTING HELPERS
+# FORMATTING & NORMALIZATION HELPERS
 # =====================================================================
 def format_european(val):
-    """Format number to European style (dot for thousands, comma for decimals)."""
     if pd.isna(val):
         return val
     if isinstance(val, (int, float)):
-        # If integer or effectively integer
         if isinstance(val, int) or val.is_integer():
             return f"{int(val):,}".replace(',', '.')
         
         abs_val = abs(val)
-        
-        # If it's a very small non-zero number, use 4 decimal places
         if 0 < abs_val < 0.01:
             formatted = f"{val:,.4f}"
         else:
             formatted = f"{val:,.2f}"
             
-        # Replace point with comma
         return formatted.translate(str.maketrans(',.', '.,'))
     return val
 
 def format_dataframe_display(df):
-    """Apply European formatting to all numeric columns in a DataFrame for display."""
     df_display = df.copy()
     for col in df_display.columns:
         if df_display[col].dtype in ['float64', 'int64']:
-            # Do not format integer columns like Tokens with decimals
             if 'Token' in col or 'IS_AI' in col:
+                df_display[col] = df_display[col].replace([np.inf, -np.inf], np.nan)
                 df_display[col] = df_display[col].apply(lambda x: str(int(x)) if pd.notna(x) else x)
             else:
                 df_display[col] = df_display[col].apply(format_european)
-        # Fix $ formatting to ensure it has commas
         if 'Cost_$' in col and df_display[col].dtype == 'object':
              df_display[col] = df_display[col].str.replace('.', ',')
     return df_display
 
-# =====================================================================
-# DATA NORMALIZATION HELPERS
-# =====================================================================
+def add_percent_to_labels(df, value_col, label_col):
+    total = df[value_col].sum()
+    if total > 0:
+        def format_pct(val):
+            pct = (val / total) * 100
+            if pct == 0:
+                return "0%"
+            elif pct < 0.001:
+                return "<0.001%"
+            elif pct < 1.0:
+                return f"{pct:.3f}%"
+            else:
+                return f"{pct:.1f}%"
+        df[label_col] = df.apply(lambda row: f"{row[label_col]} ({format_pct(row[value_col])})", axis=1)
+    return df
+
 def normalize_model_name(name):
     if pd.isna(name) or name is None:
         return ""
-    
     name = str(name).lower().strip()
-    
     for prefix in ['eu.anthropic.', 'us.anthropic.', 'anthropic.', 'openai.', 'meta.']:
         name = name.replace(prefix, '')
-        
     name = name.split('-v')[0]
     name = name.split('@')[0]
     name = re.sub(r'-\d{4}-\d{2}-\d{2}$', '', name)
-    
     return name.strip()
+
+def parse_period_to_hours(period_str):
+    if pd.isna(period_str) or not isinstance(period_str, str):
+        return None
+        
+    s = period_str.lower()
+    qty_match = re.search(r'([\d\.]+)', s)
+    qty = float(qty_match.group(1)) if qty_match else 1.0
+    
+    if 'minute' in s or 'min' in s: return qty * (1/60)
+    if 'hour' in s or 'hr' in s: return qty * 1
+    if 'day' in s: return qty * 24
+    if 'week' in s: return qty * 168
+    if 'month' in s: return qty * 730
+    if 'year' in s: return qty * 8760
+    
+    return None
 
 # =====================================================================
 # DATA LOADING & COST CALCULATION
@@ -190,9 +221,6 @@ def process_dataframe(df):
     df['Operational_Emissions_gCO2e'] = df['Total Carbon Footprint (g CO2e)']
     return df
 
-# =====================================================================
-# ANTI-DOUBLE COUNTING FILTER HELPER
-# =====================================================================
 def apply_phase_filter(df, view_phases):
     if "Baseline (Pre)" in view_phases and "Optimized (Post)" in view_phases:
         return df.copy()
@@ -240,7 +268,6 @@ if filtered_df.empty:
     st.warning("No data available for the selected project filters.")
     st.stop()
 
-# Tag which rows belong to a Post-Optimization execution globally
 filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZATION)', regex=False)
 
 # =====================================================================
@@ -259,14 +286,11 @@ tab_global, tab_standard, tab_ai, tab_drilldown = st.tabs([
 with tab_global:
     st.subheader("📋 Telemetry Registry (`CO_SOFTWARE_CARBON_INTENSITY`)")
     
-    # Updated Display Order: Date, Project, SCI Score, then the rest
     base_cols = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'Component / Step' if 'Component / Step' in filtered_df.columns else 'PROCESS_DESC']
     display_cols = [c for c in base_cols if c in filtered_df.columns]
     
     other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
     display_cols.extend([c for c in other_cols if c in filtered_df.columns])
-    
-    # Add any remaining columns except Join_Key
     display_cols.extend([col for col in filtered_df.columns if col not in display_cols and col != 'Join_Key'])
     
     df_display_tab1 = format_dataframe_display(filtered_df[display_cols].sort_values(by="Date", ascending=False))
@@ -292,8 +316,6 @@ with tab_global:
 
     st.divider()
     
-    # --- PHASE SELECTOR FOR GLOBAL CHARTS ---
-    # Default changed to Baseline (Pre)
     tab1_phases = st.multiselect(
         "⚖️ Select Phase (Filters footprint distribution charts below):", 
         options=["Baseline (Pre)", "Optimized (Post)"],
@@ -306,7 +328,9 @@ with tab_global:
     c1, c2 = st.columns(2)
     with c1:
         proj_agg = df_tab1.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+        proj_agg = add_percent_to_labels(proj_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
         fig_pie = px.pie(proj_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Footprint by Project", hole=0.4)
+        fig_pie.update_traces(textinfo='none')
         st.plotly_chart(fig_pie, use_container_width=True)
     with c2:
         df_tab1['Workload_Type'] = df_tab1['IS_AI'].apply(lambda x: 'AI / LLM Inference' if x == 1 else 'Standard Code')
@@ -315,7 +339,7 @@ with tab_global:
         st.plotly_chart(fig_ai, use_container_width=True)
 
     st.divider()
-    st.subheader("⚡ SCI Breakdown: Operational (E × I) vs Embodied Carbon (M)")
+    st.subheader("⚡ Average SCI Breakdown: Operational (E × I) vs Embodied Carbon (M)")
     lifespan_years = st.slider("Hardware Lifespan Simulator (Years)", min_value=1, max_value=10, value=4, step=1, key="global_lifespan")
     df_grouped = df_tab1.groupby('Project').agg({
         'Embodied Emissions - M (g CO2e)': 'sum', 'Operational_Emissions_gCO2e': 'sum', 'Functional Unit - R (Transactions)': 'sum'
@@ -329,6 +353,13 @@ with tab_global:
         go.Bar(name='Embodied Emissions (M / R)', x=df_grouped['Project'], y=df_grouped['Embodied_gCO2e_tx'], marker_color='#e74c3c')
     ])
     fig_stack.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
+    
+    global_avg_sci = df_tab1['SCI Score (g CO2e/tx)'].mean()
+    if pd.notna(global_avg_sci):
+        fig_stack.add_hline(y=global_avg_sci, line_dash="dash", line_color="gray", 
+                            annotation_text=f"Global Avg SCI: {global_avg_sci:.2f}", 
+                            annotation_position="top left")
+    
     st.plotly_chart(fig_stack, use_container_width=True)
 
 # =====================================================================
@@ -346,7 +377,6 @@ with tab_standard:
         st.dataframe(df_display_tab2, use_container_width=True)
         st.divider()
 
-        # --- PHASE SELECTOR FOR STANDARD METRICS ---
         tab2_phases = st.multiselect(
             "⚖️ Select Phase (Filters KPIs and charts below):", 
             options=["Baseline (Pre)", "Optimized (Post)"],
@@ -373,7 +403,9 @@ with tab_standard:
         c3, c4 = st.columns(2)
         with c3:
             std_agg = df_tab2.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+            std_agg = add_percent_to_labels(std_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
             fig_pie_std = px.pie(std_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by Standard Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig_pie_std.update_traces(textinfo='none')
             st.plotly_chart(fig_pie_std, use_container_width=True)
         with c4:
             st.markdown("**(Hardware Lifespan Simulator)**")
@@ -382,11 +414,19 @@ with tab_standard:
             df_std_grp['M_Adjusted'] = df_std_grp['Embodied Emissions - M (g CO2e)'] / lifespan_std
             df_std_grp['Embodied_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['M_Adjusted'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
             df_std_grp['Operational_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['Operational_Emissions_gCO2e'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
+            
             fig_stack_std = go.Figure(data=[
                 go.Bar(name='Operational', x=df_std_grp['Project'], y=df_std_grp['Operational_gCO2e_tx'], marker_color='#2ecc71'),
                 go.Bar(name='Embodied', x=df_std_grp['Project'], y=df_std_grp['Embodied_gCO2e_tx'], marker_color='#e74c3c')
             ])
-            fig_stack_std.update_layout(barmode='stack')
+            fig_stack_std.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
+            
+            std_avg_sci = df_tab2['SCI Score (g CO2e/tx)'].mean()
+            if pd.notna(std_avg_sci):
+                fig_stack_std.add_hline(y=std_avg_sci, line_dash="dash", line_color="gray", 
+                                        annotation_text=f"Std Avg SCI: {std_avg_sci:.2f}", 
+                                        annotation_position="top left")
+                                        
             st.plotly_chart(fig_stack_std, use_container_width=True)
 
 # =====================================================================
@@ -399,26 +439,22 @@ with tab_ai:
     else:
         st.subheader("📋 AI Projects Registry")
         
-        # Updated Display Order for AI
         base_cols_ai = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'AI_MODEL_NAME']
         display_cols_ai = [c for c in base_cols_ai if c in df_ai_base.columns]
         other_cols_ai = ['Total_Tokens', 'Total Carbon Footprint (g CO2e)', 'Estimated_Cost_$']
         display_cols_ai.extend([c for c in other_cols_ai if c in df_ai_base.columns])
         
-        # Add remaining cols
         display_cols_ai.extend([c for c in df_ai_base.columns if c not in display_cols_ai and c != 'Join_Key'])
         
         formatted_df_ai = df_ai_base.copy()
         
         df_display_tab3 = format_dataframe_display(formatted_df_ai[display_cols_ai].sort_values(by="Date", ascending=False))
-        # Re-apply cost formatting specifically to maintain the $ sign but with comma
         if 'Estimated_Cost_$' in df_display_tab3.columns:
             df_display_tab3['Estimated_Cost_$'] = df_ai_base['Estimated_Cost_$'].apply(lambda x: f"${x:.4f}".replace('.', ','))
 
         st.dataframe(df_display_tab3, use_container_width=True)
         st.divider()
 
-        # --- PHASE SELECTOR FOR AI METRICS ---
         tab3_phases = st.multiselect(
             "⚖️ Select Phase (Filters KPIs and charts below):", 
             options=["Baseline (Pre)", "Optimized (Post)"],
@@ -442,20 +478,24 @@ with tab_ai:
 
         st.divider()
         st.subheader("📊 AI Analytics & Financial FinOps")
-        r1, r2 = st.columns(2)
-        with r1:
-            ai_agg_proj = df_tab3.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
-            fig_pie_ai = px.pie(ai_agg_proj, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by AI Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig_pie_ai, use_container_width=True)
-        with r2:
-            total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():.4f}".replace('.', ',')
-            st.markdown(f'<div class="metric-card-ai" style="text-align: center; margin-bottom: 20px;"><h4>Total FinOps Cost Across All AI Projects</h4><h2 style="font-size: 2.5rem !important;">{total_cost_str}</h2></div>', unsafe_allow_html=True)
-            cost_agg_proj = df_tab3.groupby('Project')['Estimated_Cost_$'].sum().reset_index()
-            fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color='Project', color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig_cost_proj, use_container_width=True)
+        
+        ai_agg_proj = df_tab3.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+        ai_agg_proj = add_percent_to_labels(ai_agg_proj, 'Total Carbon Footprint (g CO2e)', 'Project')
+        fig_pie_ai = px.pie(ai_agg_proj, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by AI Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig_pie_ai.update_traces(textinfo='none')
+        st.plotly_chart(fig_pie_ai, use_container_width=True)
+        
+        st.write("") 
+        
+        total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():.4f}".replace('.', ',')
+        st.markdown(f'<div class="metric-card-ai" style="text-align: center; margin-bottom: 20px;"><h4>Total FinOps Cost Across All AI Projects</h4><h2 style="font-size: 2.5rem !important;">{total_cost_str}</h2></div>', unsafe_allow_html=True)
+        
+        cost_agg_proj = df_tab3.groupby('Project')['Estimated_Cost_$'].sum().reset_index()
+        fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
+        st.plotly_chart(fig_cost_proj, use_container_width=True)
 
 # =====================================================================
-# TAB 4: PROJECT DRILL-DOWN (Uses full 'filtered_df' for Pre vs Post math)
+# TAB 4: PROJECT DRILL-DOWN (With Time Normalization Engine & Project KPIs)
 # =====================================================================
 with tab_drilldown:
     st.subheader("🔍 Detailed Project Analysis")
@@ -464,6 +504,121 @@ with tab_drilldown:
     selected_proj_drill = st.selectbox("Select a project to analyze:", options=filtered_df['Project'].unique())
     
     if selected_proj_drill:
+        df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
+        is_ai_proj = df_proj['IS_AI'].iloc[0] == 1 if not df_proj.empty else False
+        
+        if 'MEASUREMENT_PERIOD' not in df_proj.columns:
+            df_proj['MEASUREMENT_PERIOD'] = np.nan
+            
+        df_proj['MEASUREMENT_PERIOD'] = df_proj['MEASUREMENT_PERIOD'].fillna(KNOWN_PERIODS.get(selected_proj_drill, "Unknown"))
+        period_text = df_proj['MEASUREMENT_PERIOD'].iloc[0]
+
+        # Check if period is mathematically parseable (not unknown)
+        can_normalize = False
+        for idx, row in df_proj.iterrows():
+            if parse_period_to_hours(row['MEASUREMENT_PERIOD']) is not None:
+                can_normalize = True
+                break
+        
+        # --- TIME NORMALIZATION ENGINE ---
+        if can_normalize and "unknown" not in period_text.lower():
+            df_proj_raw = df_proj.copy() # Keep raw copy for projection chart
+            
+            st.write("")
+            st.markdown("### ⏱️ Time Normalization Engine")
+            st.info("Different components in this project were measured over different timeframes. Select a target timeframe to mathematically project and align all absolute metrics (Total Carbon, Energy, Cost). **SCI Scores remain unaffected.**")
+            
+            target_scale = st.radio(
+                "Project metrics to:", 
+                options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
+                horizontal=True
+            )
+            
+            scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
+            
+            # 1. Apply user selection mathematically to the dataframe FIRST
+            if target_scale != "Raw Data (No Scaling)":
+                target_hours = scale_map[target_scale]
+                for idx, row in df_proj.iterrows():
+                    base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
+                    if base_hours and base_hours > 0:
+                        multiplier = target_hours / base_hours
+                        df_proj.at[idx, 'Total Carbon Footprint (g CO2e)'] *= multiplier
+                        df_proj.at[idx, 'Energy Consumed - E (kWh)'] *= multiplier
+                        if 'Estimated_Cost_$' in df_proj.columns:
+                            df_proj.at[idx, 'Estimated_Cost_$'] *= multiplier
+                            
+                        suffix = f" [Projected to {target_scale.split(' ')[0]}]"
+                        df_proj.at[idx, 'PROCESS_DESC'] = f"{row['PROCESS_DESC']}{suffix}"
+                        if pd.notna(row['AI_MODEL_NAME']):
+                            df_proj.at[idx, 'AI_MODEL_NAME'] = f"{row['AI_MODEL_NAME']}{suffix}"
+
+            # 2. Sub-feature: Dynamic Component Comparison Chart
+            with st.expander("📊 View Component Comparison Chart", expanded=False):
+                proj_metric = st.selectbox(
+                    "Select metric to compare across components:", 
+                    ["Total Carbon Footprint (g CO2e)", "Energy Consumed - E (kWh)", "Estimated_Cost_$"]
+                )
+                
+                group_col_compare = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
+                
+                # Group by component using the currently scaled data
+                compare_df = df_proj.groupby(group_col_compare)[proj_metric].sum().reset_index()
+                compare_df = compare_df.sort_values(by=proj_metric, ascending=False)
+                
+                # Dynamic orientation based on item count
+                num_compare_items = len(compare_df)
+                is_horizontal_comp = num_compare_items >= 8
+                comp_orientation = 'h' if is_horizontal_comp else 'v'
+                comp_height = max(400, num_compare_items * 25) if is_horizontal_comp else 400
+                
+                x_ax = proj_metric if is_horizontal_comp else group_col_compare
+                y_ax = group_col_compare if is_horizontal_comp else proj_metric
+                
+                # Use sequential colors depending on the metric
+                color_seq = DARK_BLUES if 'Cost' in proj_metric else DARK_PURPLES
+                
+                fig_comp = px.bar(
+                    compare_df, x=x_ax, y=y_ax, color=group_col_compare,
+                    title=f"{proj_metric.split(' (')[0]} by Component ({target_scale})", 
+                    orientation=comp_orientation, height=comp_height,
+                    color_discrete_sequence=color_seq
+                )
+                st.plotly_chart(fig_comp, use_container_width=True)
+                
+        # --- PROJECT SPECIFIC KPIS ---
+        st.divider()
+        st.subheader(f"📈 Key Impact Metrics (KPIs): {selected_proj_drill}")
+        pm1, pm2, pm3, pm4 = st.columns(4)
+        
+        proj_total_carbon = df_proj['Total Carbon Footprint (g CO2e)'].sum()
+        proj_avg_sci = df_proj['SCI Score (g CO2e/tx)'].mean()
+        proj_total_energy = df_proj['Energy Consumed - E (kWh)'].sum()
+        
+        if not df_proj.empty:
+            hotspot_idx = df_proj['Total Carbon Footprint (g CO2e)'].idxmax()
+            proj_hotspot = df_proj.loc[hotspot_idx]['PROCESS_DESC'] if not is_ai_proj else df_proj.loc[hotspot_idx]['AI_MODEL_NAME']
+        else:
+            proj_hotspot = "N/A"
+            
+        with pm1:
+            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_european(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+        with pm2:
+            st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_european(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
+        with pm3:
+            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_european(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
+        with pm4:
+            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
+        
+        st.write("")
+
+        # Disclaimers
+        if selected_proj_drill == "Galileo":
+            st.info(
+                "**Galileo Telemetry Data Notes:**\n\n"
+                "• **Token Aggregation:** The raw dataset provides a single combined 'Tokens' count. Since the exact split between prompt and completion tokens is unavailable, all consumed tokens have been aggregated and logged under `PROMPT_TOKENS`.\n\n"
+                "• **Data Filtering & Integrity:** The initial raw dataset contained over 2,500 entries. To maintain accurate SCI and carbon calculations, rows with an 'Unknown' provider were excluded. A final filter to match supported and recognized AI models finalized the dataset at exactly **186 valid rows**."
+            )
 
         if selected_proj_drill == "Archimedes Lever":
             st.warning(
@@ -472,8 +627,6 @@ with tab_drilldown:
                 "Since this specific model version is not yet supported by standard carbon tracking APIs, "
                 "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model."
             )
-        df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
-        is_ai_proj = df_proj['IS_AI'].iloc[0] == 1 if not df_proj.empty else False
         
         df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
         df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
@@ -483,12 +636,14 @@ with tab_drilldown:
             'SCI Score (g CO2e/tx)': 'mean',
             'Energy Consumed - E (kWh)': 'sum', 
             'Total Carbon Footprint (g CO2e)': 'sum', 
-            'Estimated_Cost_$': 'sum'
+            'Estimated_Cost_$': 'sum',
+            'MEASUREMENT_PERIOD': 'first'
         }).reset_index()
         
         breakdown_table = breakdown_table.rename(columns={
             group_col_table: 'Component / Step', 
-            'SCI Score (g CO2e/tx)': 'Average SCI Score (g CO2e/tx)'
+            'SCI Score (g CO2e/tx)': 'Average SCI Score (g CO2e/tx)',
+            'MEASUREMENT_PERIOD': 'Original Period'
         })
         
         formatted_breakdown = format_dataframe_display(breakdown_table)
@@ -509,30 +664,37 @@ with tab_drilldown:
             'Estimated_Cost_$': 'sum'
         }).reset_index().rename(columns={group_col_chart: 'Component / Step'})
 
+        num_items = len(breakdown_chart)
+        is_horizontal = num_items >= 8
+        orientation_flag = 'h' if is_horizontal else 'v'
+        
+        breakdown_chart = breakdown_chart.sort_values(by='Total Carbon Footprint (g CO2e)', ascending=is_horizontal)
+        dynamic_chart_height = max(450, num_items * 25) if is_horizontal else 450
+        
+        x_carbon = 'Total Carbon Footprint (g CO2e)' if is_horizontal else 'Component / Step'
+        y_carbon = 'Component / Step' if is_horizontal else 'Total Carbon Footprint (g CO2e)'
+        
+        x_cost = 'Estimated_Cost_$' if is_horizontal else 'Component / Step'
+        y_cost = 'Component / Step' if is_horizontal else 'Estimated_Cost_$'
+
+        st.write("") 
+
+        fig_drill_carbon = px.bar(
+            breakdown_chart, x=x_carbon, y=y_carbon, color='Component / Step',
+            title="Carbon Impact Breakdown", 
+            orientation=orientation_flag, height=dynamic_chart_height,
+            color_discrete_sequence=DARK_PURPLES
+        )
+        st.plotly_chart(fig_drill_carbon, use_container_width=True)
+        
         if is_ai_proj:
-            d1, d2 = st.columns(2)
-            with d1:
-                fig_drill_carbon = px.bar(
-                    breakdown_chart, x='Component / Step', y='Total Carbon Footprint (g CO2e)', 
-                    title="Carbon Impact Breakdown", 
-                    color='Total Carbon Footprint (g CO2e)', color_continuous_scale='Purples'
-                )
-                st.plotly_chart(fig_drill_carbon, use_container_width=True)
-            
-            with d2:
-                fig_drill_cost = px.bar(
-                    breakdown_chart, x='Component / Step', y='Estimated_Cost_$', 
-                    title="Cost Impact Breakdown ($)", 
-                    color='Estimated_Cost_$', color_continuous_scale='Blues'
-                )
-                st.plotly_chart(fig_drill_cost, use_container_width=True)
-        else:
-            fig_drill = px.bar(
-                breakdown_chart, x='Component / Step', y='Total Carbon Footprint (g CO2e)', 
-                title=f"Carbon Impact Breakdown ({chart_df['Status'].iloc[0] if not chart_df.empty else 'Baseline'})", 
-                color='Total Carbon Footprint (g CO2e)', color_continuous_scale='Greens'
-            ) 
-            st.plotly_chart(fig_drill, use_container_width=True)
+            fig_drill_cost = px.bar(
+                breakdown_chart, x=x_cost, y=y_cost, color='Component / Step',
+                title="Cost Impact Breakdown ($)", 
+                orientation=orientation_flag, height=dynamic_chart_height,
+                color_discrete_sequence=DARK_BLUES
+            )
+            st.plotly_chart(fig_drill_cost, use_container_width=True)
 
         # =====================================================================
         # PRE VS POST OPTIMIZATION SAVINGS MODULE
@@ -584,7 +746,6 @@ with tab_drilldown:
             carbon_saved = pre_carbon_total - post_carbon_total
             carbon_pct = (carbon_saved / pre_carbon_total * 100) if pre_carbon_total > 0 else 0
             
-            # Format saved strings with comma
             carbon_saved_str = format_european(carbon_saved)
             carbon_pct_str = format_european(-carbon_pct)
             
@@ -600,13 +761,12 @@ with tab_drilldown:
             else:
                 st.metric("Total Carbon Reduction", f"{carbon_saved_str} gCO₂e", f"{carbon_pct_str}%", delta_color="inverse")
             
-            # --- REAL WORLD EQUIVALENTS ---
             if carbon_saved >= 8.0:
                 st.markdown("#### 🌍 Real-World Impact Equivalent")
-                smartphones = carbon_saved / 8.0 # Approx 8g CO2 per smartphone charge
+                smartphones = carbon_saved / 8.0 
                 
                 if carbon_saved >= 192.0:
-                    km_driven = carbon_saved / 192.0 # Approx 192g CO2 per km for average petrol car
+                    km_driven = carbon_saved / 192.0 
                     st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{int(smartphones)} smartphones**!")
                 else:
                     st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{int(smartphones)} smartphones**!")   
