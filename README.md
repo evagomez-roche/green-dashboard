@@ -1,4 +1,4 @@
-```markdown
+
 # Roche Green SDK - Digital Sustainability 
 
 Welcome to the **Roche Green SDK**. This tool allows you to measure the carbon footprint of your software and calculate the Software Carbon Intensity (SCI) of your code, whether it is traditional processing (CPU/RAM) or Artificial Intelligence inference (SCI for AI).
