@@ -15,7 +15,6 @@ You do not need to set up complex infrastructure or connect to an external API. 
    ```bash
    pip install -e ./roche_green_sdk
 
-```
 
 *(This will automatically install the required dependencies: `codecarbon` and `requests`).*
 
