@@ -494,8 +494,53 @@ with tab_ai:
         fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
         st.plotly_chart(fig_cost_proj, use_container_width=True)
 
+   # =====================================================================
+# FORMATTING HELPERS (Add these at the top of your app.py)
 # =====================================================================
-# TAB 4: PROJECT DRILL-DOWN (With Time Normalization Engine & Project KPIs)
+def format_time_duration(seconds):
+    """Converts seconds into a human-readable compound format (e.g., '1 week and 4 days')"""
+    if seconds <= 0: return "0 seconds"
+    if seconds < 60: return f"{int(seconds)} seconds"
+    
+    minutes = seconds // 60
+    sec_rem = seconds % 60
+    if minutes < 60: 
+        return f"{int(minutes)} minutes" + (f" and {int(sec_rem)} seconds" if sec_rem > 0 else "")
+    
+    hours = seconds // 3600
+    min_rem = (seconds % 3600) // 60
+    if hours < 24: 
+        return f"{int(hours)} hours" + (f" and {int(min_rem)} minutes" if min_rem > 0 else "")
+    
+    days = seconds // 86400
+    hours_rem = (seconds % 86400) // 3600
+    if days < 7: 
+        return f"{int(days)} days" + (f" and {int(hours_rem)} hours" if hours_rem > 0 else "")
+    
+    weeks = seconds // 604800
+    days_rem = (seconds % 604800) // 86400
+    if weeks < 4: 
+        return f"{int(weeks)} weeks" + (f" and {int(days_rem)} days" if days_rem > 0 else "")
+    
+    months = seconds // 2592000 # Approx 30 days
+    weeks_rem = (seconds % 2592000) // 604800
+    if months < 12: 
+        return f"{int(months)} months" + (f" and {int(weeks_rem)} weeks" if weeks_rem > 0 else "")
+    
+    years = seconds // 31536000
+    months_rem = (seconds % 31536000) // 2592000
+    return f"{int(years)} years" + (f" and {int(months_rem)} months" if months_rem > 0 else "")
+
+def format_uk_pct(pct):
+    """Formats percentage with dynamic decimals depending on scale."""
+    if pct == 0: return "0%"
+    elif pct >= 1: return f"{pct:.2f}%"
+    elif pct >= 0.01: return f"{pct:.2f}%" 
+    elif pct >= 0.0001: return f"{pct:.4f}%" 
+    else: return "~0% (negligible fraction)"
+
+# =====================================================================
+# TAB 4: PROJECT DRILL-DOWN 
 # =====================================================================
 with tab_drilldown:
     st.subheader("🔍 Detailed Project Analysis")
@@ -611,6 +656,133 @@ with tab_drilldown:
             st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
         
         st.write("")
+
+        # --- BENCHMARK & CONTEXT (ANDY'S REQUEST) ---
+        st.divider()
+        st.markdown("### 📊 Benchmark & Real-World Context")
+        
+        # 1. Calculate Global SCI Statistics for context (GROUPED BY PROJECT)
+        project_avg_scis = filtered_df.groupby('Project')['SCI Score (g CO2e/tx)'].mean()
+        global_sci_stats = project_avg_scis.describe()
+        global_median_sci = project_avg_scis.median()
+        
+        # DISPLAY THE 4 NUMBERS
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Global SCI (Min)", f"{format_european(global_sci_stats['min'])} g/tx")
+        c2.metric("Global SCI (Median)", f"{format_european(global_median_sci)} g/tx")
+        c3.metric("Global SCI (Average)", f"{format_european(global_sci_stats['mean'])} g/tx")
+        c4.metric("Global SCI (Max)", f"{format_european(global_sci_stats['max'])} g/tx")
+        
+        st.write("")
+        
+        # Explain Absolute vs Intensity comparison dynamically
+        col_bench1, col_bench2 = st.columns(2)
+        project_totals = filtered_df.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum()
+        global_median_carbon = project_totals.median()
+        
+        with col_bench1:
+            st.markdown("**1. Absolute Environmental Impact (Total Carbon)**")
+            if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon):
+                if proj_total_carbon > global_median_carbon:
+                    st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_european(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_european(global_median_carbon)} gCO₂e).")
+                else:
+                    st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_european(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_european(global_median_carbon)} gCO₂e).")
+        
+        with col_bench2:
+            st.markdown("**2. Software Code Efficiency (Average SCI)**")
+            if pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
+                if proj_avg_sci > global_median_sci:
+                    st.warning(f"⚠️ **Opportunity for Improvement:** This project's intensity per transaction ({format_european(proj_avg_sci)} g/tx) is **higher** than the global median ({format_european(global_median_sci)} g/tx).")
+                else:
+                    st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_european(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_european(global_median_sci)} g/tx).")
+
+        st.caption("*Note: A project like a high-traffic AI model might have a large Total Carbon footprint due to high user demand, while maintaining a highly efficient SCI score per request.*")
+        
+        # --- EXECUTIVE INSIGHT (DYNAMIC CONTEXT - DIPLOMATIC TONE) ---
+        st.write("")
+        st.markdown("#### 🧠 Executive Insight")
+        
+        if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon) and pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
+            is_high_carbon = proj_total_carbon > global_median_carbon
+            is_high_sci = proj_avg_sci > global_median_sci
+            
+            if is_high_carbon and not is_high_sci:
+                st.success(
+                    "**Scale with Efficiency:** While the total footprint reflects a massive processing volume, the SCI score remains below the global average. "
+                    "This indicates the software architecture is successfully handling high demand with strong per-transaction efficiency. "
+                    "The footprint is driven by business growth, not architectural waste."
+                )
+            elif not is_high_carbon and is_high_sci:
+                st.info(
+                    "**Early Optimization Opportunity:** Current absolute emissions are kept low by moderate usage volumes. "
+                    "However, the higher-than-average SCI suggests there is room to refine the code. "
+                    "Addressing this proactively will prevent disproportionate cloud costs and emissions as the project scales."
+                )
+            elif is_high_carbon and is_high_sci:
+                st.warning(
+                    "**High-Impact Optimization Area:** This project operates at a significant scale and currently shows a higher-than-average SCI. "
+                    "This presents an excellent opportunity: even minor architectural or code-level optimizations here will yield massive, "
+                    "highly visible reductions in both global CO₂ emissions and financial operating costs."
+                )
+            else:
+                st.success(
+                    "**Sustainable Baseline:** This project currently operates with both a low absolute footprint and a highly efficient SCI score. "
+                    "It serves as a strong internal benchmark for Green Software best practices."
+                )
+        
+        st.write("")
+        
+        # 2. Real World Equivalents & Intensity Context
+        st.markdown("#### 🌍 Real-World Equivalents & Intensity Context")
+        
+        # Intensity Context (SCI)
+        if is_ai_proj:
+            st.info(f"💡 **Intensity Context (AI):** This project's average SCI is **{format_european(proj_avg_sci)} gCO₂e/tx**. For comparison, an average ChatGPT or Gemini text prompt emits between **2.0 and 3.0 gCO₂e**.")
+        else:
+            st.info(f"💡 **Intensity Context (Standard):** This project's average SCI is **{format_european(proj_avg_sci)} gCO₂e/tx**. For comparison, a standard Google web search emits roughly **0.2 gCO₂e**.")
+
+        # Total Impact Context (Energy & Carbon)
+        if proj_total_energy > 0 or proj_total_carbon > 0:
+            if is_ai_proj:
+                # AI Context 
+                total_wh = proj_total_energy * 1000
+                gemini_queries_eq = total_wh / 0.24 if total_wh > 0 else 0
+                
+                microwave_seconds = gemini_queries_eq * 1
+                fridge_seconds = gemini_queries_eq * 6
+                
+                microwave_str = format_time_duration(microwave_seconds)
+                fridge_str = format_time_duration(fridge_seconds)
+                
+                st.info(
+                    f"💡 **Energy Context (AI):** The {format_european(proj_total_energy)} kWh used by this project equals **{format_european(total_wh)} Wh**. "
+                    f"According to recent Google estimates, a standard Gemini text query uses 0.24 Wh. "
+                    f"This project's total energy is equivalent to running a microwave for **{microwave_str}** or a standard fridge for **{fridge_str}**."
+                )
+            else:
+                # Standard Context (Non-AI) with small impact protection
+                if proj_total_carbon < 8.0:
+                    st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
+                else:
+                    smartphones = int(proj_total_carbon / 8.0)
+                    km_driven = proj_total_carbon / 192.0
+                    
+                    if km_driven < 1:
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
+                    else:
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{smartphones} smartphones**.")
+                
+            # Shared Carbon Context applied to BOTH AI and Non-AI
+            uk_annual_carbon_g = 7000000.0 # 7 tonnes
+            pct_of_uk_citizen = (proj_total_carbon / uk_annual_carbon_g) * 100
+            
+            st.info(
+                f"💡 **Carbon Context:** The average UK citizen emits 7 tonnes of CO₂ annually from energy and industry. "
+                f"This project's total footprint ({format_european(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
+            )
+        else:
+            st.info("💡 **Context:** The recorded energy and carbon totals for this timeframe are currently **0**. Process more data to see real-world equivalents.")
+
 
         # Disclaimers
         if selected_proj_drill == "Galileo":
@@ -763,13 +935,13 @@ with tab_drilldown:
             
             if carbon_saved >= 8.0:
                 st.markdown("#### 🌍 Real-World Impact Equivalent")
-                smartphones = carbon_saved / 8.0 
+                smartphones = int(carbon_saved / 8.0) 
                 
                 if carbon_saved >= 192.0:
                     km_driven = carbon_saved / 192.0 
-                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{int(smartphones)} smartphones**!")
+                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{smartphones} smartphones**!")
                 else:
-                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{int(smartphones)} smartphones**!")   
+                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{smartphones} smartphones**!")   
             
             pre_steps = set(df_pre['Clean_Step'].unique())
             post_steps = set(df_post['Clean_Step'].unique())
