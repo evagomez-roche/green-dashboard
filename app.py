@@ -11,7 +11,7 @@ import re
 # PAGE CONFIGURATION & KNOWN METADATA
 # =====================================================================
 st.set_page_config(
-    page_title="SCI Carbon Dashboard",
+    page_title="SCITracker Dashboard",
     page_icon="🌱",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -19,10 +19,12 @@ st.set_page_config(
 
 # Manual fallback for measurement periods until integrated into the SQLite schema
 KNOWN_PERIODS = {
-    "Galileo": "Unknown (Jan 1st, 2025 - Aug 5th, 2026)",
-    "myCO2": "1 Hour (Frontend/API) - Pending DWH merge",
+    "Galileo": "582 days",
+    "myCO2": "1 Month",
     "Archimedes Lever": "Unknown",
-    "ris-ase-fp-analyzer": "5 Minutes (Automated Assessment)"
+    "ris-ase-fp-analyzer": "5 Minutes",
+    "PTCoremind": "24 Hours",
+    "EcoFocus application": "1 Week"
 }
 
 # Custom Color Palettes for High Contrast Bar Charts
@@ -65,26 +67,25 @@ st.markdown('''
     </style>
 ''', unsafe_allow_html=True)
 
-st.title("🌱 Software Carbon Intensity (SCI) Dashboard")
+st.title("🌱 SCITracker: Software Carbon Intensity Dashboard")
 st.caption("Green Software Foundation Telemetry & Real-Time Analytics")
 
 # =====================================================================
 # FORMATTING & NORMALIZATION HELPERS
 # =====================================================================
-def format_european(val):
+def format_number(val):
+    """Formats numbers to standard US/UK format: 198,730.83"""
     if pd.isna(val):
         return val
     if isinstance(val, (int, float)):
         if isinstance(val, int) or val.is_integer():
-            return f"{int(val):,}".replace(',', '.')
+            return f"{int(val):,}"
         
         abs_val = abs(val)
         if 0 < abs_val < 0.01:
-            formatted = f"{val:,.4f}"
+            return f"{val:,.4f}"
         else:
-            formatted = f"{val:,.2f}"
-            
-        return formatted.translate(str.maketrans(',.', '.,'))
+            return f"{val:,.2f}"
     return val
 
 def format_dataframe_display(df):
@@ -95,9 +96,7 @@ def format_dataframe_display(df):
                 df_display[col] = df_display[col].replace([np.inf, -np.inf], np.nan)
                 df_display[col] = df_display[col].apply(lambda x: str(int(x)) if pd.notna(x) else x)
             else:
-                df_display[col] = df_display[col].apply(format_european)
-        if 'Cost_$' in col and df_display[col].dtype == 'object':
-             df_display[col] = df_display[col].str.replace('.', ',')
+                df_display[col] = df_display[col].apply(format_number)
     return df_display
 
 def add_percent_to_labels(df, value_col, label_col):
@@ -143,6 +142,48 @@ def parse_period_to_hours(period_str):
     if 'year' in s: return qty * 8760
     
     return None
+
+def format_time_duration(seconds):
+    """Converts seconds into a human-readable compound format"""
+    if seconds <= 0: return "0 seconds"
+    if seconds < 60: return f"{int(seconds)} seconds"
+    
+    minutes = seconds // 60
+    sec_rem = seconds % 60
+    if minutes < 60: 
+        return f"{int(minutes)} minutes" + (f" and {int(sec_rem)} seconds" if sec_rem > 0 else "")
+    
+    hours = seconds // 3600
+    min_rem = (seconds % 3600) // 60
+    if hours < 24: 
+        return f"{int(hours)} hours" + (f" and {int(min_rem)} minutes" if min_rem > 0 else "")
+    
+    days = seconds // 86400
+    hours_rem = (seconds % 86400) // 3600
+    if days < 7: 
+        return f"{int(days)} days" + (f" and {int(hours_rem)} hours" if hours_rem > 0 else "")
+    
+    weeks = seconds // 604800
+    days_rem = (seconds % 604800) // 86400
+    if weeks < 4: 
+        return f"{int(weeks)} weeks" + (f" and {int(days_rem)} days" if days_rem > 0 else "")
+    
+    months = seconds // 2592000 
+    weeks_rem = (seconds % 2592000) // 604800
+    if months < 12: 
+        return f"{int(months)} months" + (f" and {int(weeks_rem)} weeks" if weeks_rem > 0 else "")
+    
+    years = seconds // 31536000
+    months_rem = (seconds % 31536000) // 2592000
+    return f"{int(years)} years" + (f" and {int(months_rem)} months" if months_rem > 0 else "")
+
+def format_uk_pct(pct):
+    """Formats percentage with dynamic decimals depending on scale."""
+    if pct == 0: return "0%"
+    elif pct >= 1: return f"{pct:.2f}%"
+    elif pct >= 0.01: return f"{pct:.2f}%" 
+    elif pct >= 0.0001: return f"{pct:.4f}%" 
+    else: return "~0% (negligible fraction)"
 
 # =====================================================================
 # DATA LOADING & COST CALCULATION
@@ -281,50 +322,98 @@ tab_global, tab_standard, tab_ai, tab_drilldown = st.tabs([
 ])
 
 # =====================================================================
-# TAB 1: GLOBAL OVERVIEW
+# TAB 1: GLOBAL OVERVIEW (With Run Rate Normalization)
 # =====================================================================
 with tab_global:
-    st.subheader("📋 Telemetry Registry (`CO_SOFTWARE_CARBON_INTENSITY`)")
+    st.subheader("🌍 Global Impact Overview (Run Rate Projection)")
+    st.markdown("Compare the true environmental and financial impact of all projects scaled to a unified timeframe.")
     
-    base_cols = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'Component / Step' if 'Component / Step' in filtered_df.columns else 'PROCESS_DESC']
-    display_cols = [c for c in base_cols if c in filtered_df.columns]
+    # --- GLOBAL TIME NORMALIZATION ENGINE ---
+    target_scale_global = st.radio(
+        "⏱️ Project all metrics to:", 
+        options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
+        horizontal=True,
+        key="global_scale"
+    )
     
-    other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
-    display_cols.extend([c for c in other_cols if c in filtered_df.columns])
-    display_cols.extend([col for col in filtered_df.columns if col not in display_cols and col != 'Join_Key'])
+    scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
+    df_global_scaled = filtered_df.copy()
     
-    df_display_tab1 = format_dataframe_display(filtered_df[display_cols].sort_values(by="Date", ascending=False))
-    st.dataframe(df_display_tab1, use_container_width=True)
+    if 'MEASUREMENT_PERIOD' not in df_global_scaled.columns:
+        df_global_scaled['MEASUREMENT_PERIOD'] = np.nan
+        
+    # Map unknown periods using the KNOWN_PERIODS dictionary dynamically
+    df_global_scaled['MEASUREMENT_PERIOD'] = df_global_scaled.apply(
+        lambda row: KNOWN_PERIODS.get(row['Project'], "Unknown") if pd.isna(row['MEASUREMENT_PERIOD']) else row['MEASUREMENT_PERIOD'], 
+        axis=1
+    )
+    
+    # Apply row-level mathematical projection to absolute metrics
+    if target_scale_global != "Raw Data (No Scaling)":
+        target_hours = scale_map[target_scale_global]
+        scale_cols = ['Total Carbon Footprint (g CO2e)', 'Energy Consumed - E (kWh)', 'Estimated_Cost_$', 'Embodied Emissions - M (g CO2e)', 'Operational_Emissions_gCO2e', 'Functional Unit - R (Transactions)']
+        
+        def scale_global_row(row):
+            base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
+            if base_hours and base_hours > 0:
+                mult = target_hours / base_hours
+                for col in scale_cols:
+                    if col in row.index and pd.notna(row[col]):
+                        row[col] = row[col] * mult
+            return row
+            
+        df_global_scaled = df_global_scaled.apply(scale_global_row, axis=1)
+
     st.divider()
 
-    st.subheader("📈 Key Impact Metrics (KPIs)")
+    # --- TELEMETRY REGISTRY ---
+    st.subheader("📋 Telemetry Registry (`CO_SOFTWARE_CARBON_INTENSITY`)")
+    
+    base_cols = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'Component / Step' if 'Component / Step' in df_global_scaled.columns else 'PROCESS_DESC']
+    display_cols = [c for c in base_cols if c in df_global_scaled.columns]
+    
+    other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
+    display_cols.extend([c for c in other_cols if c in df_global_scaled.columns])
+    display_cols.extend([col for col in df_global_scaled.columns if col not in display_cols and col != 'Join_Key'])
+    
+    df_display_tab1 = format_dataframe_display(df_global_scaled[display_cols].sort_values(by="Date", ascending=False))
+    st.dataframe(df_display_tab1, use_container_width=True)
+    
+    st.divider()
+
+    # --- KPIs ---
+    st.subheader(f"📈 Key Impact Metrics ({target_scale_global})")
     m1, m2, m3, m4 = st.columns(4)
-    total_carbon = filtered_df['Total Carbon Footprint (g CO2e)'].sum()
-    avg_sci = filtered_df['SCI Score (g CO2e/tx)'].mean()
-    total_energy = filtered_df['Energy Consumed - E (kWh)'].sum()
-    max_su_idx = filtered_df['SCI Score (g CO2e/tx)'].idxmax()
-    max_su = filtered_df.loc[max_su_idx]['SCI Tracker ID'] if pd.notna(max_su_idx) else "N/A"
+    total_carbon = df_global_scaled['Total Carbon Footprint (g CO2e)'].sum()
+    avg_sci = df_global_scaled['SCI Score (g CO2e/tx)'].mean()
+    total_energy = df_global_scaled['Energy Consumed - E (kWh)'].sum()
+    
+    # Identify the highest SCI hotspot (independent of scale)
+    max_su_idx = df_global_scaled['SCI Score (g CO2e/tx)'].idxmax()
+    max_su = df_global_scaled.loc[max_su_idx]['SCI Tracker ID'] if pd.notna(max_su_idx) else "N/A"
     
     with m1:
-        st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_european(total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
     with m2:
-        st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_european(avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
     with m3:
-        st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_european(total_energy)} kWh</h2></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(total_energy)} kWh</h2></div>', unsafe_allow_html=True)
     with m4:
         st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su}</h2></div>', unsafe_allow_html=True)
 
     st.divider()
     
+    # --- PHASE FILTER ---
     tab1_phases = st.multiselect(
         "⚖️ Select Phase (Filters footprint distribution charts below):", 
         options=["Baseline (Pre)", "Optimized (Post)"],
         default=["Baseline (Pre)"],
         key="tab1_phase"
     )
-    df_tab1 = apply_phase_filter(filtered_df, tab1_phases)
+    df_tab1 = apply_phase_filter(df_global_scaled, tab1_phases)
 
-    st.subheader("📊 Footprint & Workload Distribution")
+    # --- DISTRIBUTION CHARTS ---
+    st.subheader(f"📊 Footprint & Workload Distribution ({target_scale_global})")
     c1, c2 = st.columns(2)
     with c1:
         proj_agg = df_tab1.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
@@ -339,11 +428,18 @@ with tab_global:
         st.plotly_chart(fig_ai, use_container_width=True)
 
     st.divider()
+    
+    # --- SCI BREAKDOWN (OPERATIONAL VS EMBODIED) ---
     st.subheader("⚡ Average SCI Breakdown: Operational (E × I) vs Embodied Carbon (M)")
+    st.info("SCI is an intensity ratio (gCO₂e per transaction). It remains constant regardless of the selected time projection.")
+    
     lifespan_years = st.slider("Hardware Lifespan Simulator (Years)", min_value=1, max_value=10, value=4, step=1, key="global_lifespan")
     df_grouped = df_tab1.groupby('Project').agg({
-        'Embodied Emissions - M (g CO2e)': 'sum', 'Operational_Emissions_gCO2e': 'sum', 'Functional Unit - R (Transactions)': 'sum'
+        'Embodied Emissions - M (g CO2e)': 'sum', 
+        'Operational_Emissions_gCO2e': 'sum', 
+        'Functional Unit - R (Transactions)': 'sum'
     }).reset_index()
+    
     df_grouped['M_Adjusted'] = df_grouped['Embodied Emissions - M (g CO2e)'] / lifespan_years
     df_grouped['Embodied_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['M_Adjusted'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
     df_grouped['Operational_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['Operational_Emissions_gCO2e'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
@@ -388,11 +484,11 @@ with tab_standard:
         st.subheader("📈 Standard Code KPIs")
         s1, s2, s3, s4 = st.columns(4)
         with s1:
-            st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_european(df_tab2["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_number(df_tab2["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
         with s2:
-            st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_european(df_tab2["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_number(df_tab2["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
         with s3:
-            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_european(df_tab2["Energy Consumed - E (kWh)"].sum())} kWh</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(df_tab2["Energy Consumed - E (kWh)"].sum())} kWh</h2></div>', unsafe_allow_html=True)
         with s4:
             max_su_idx_std = df_tab2['SCI Score (g CO2e/tx)'].idxmax() if not df_tab2.empty else None
             max_su_std = df_tab2.loc[max_su_idx_std]['SCI Tracker ID'] if pd.notna(max_su_idx_std) else "N/A"
@@ -420,7 +516,6 @@ with tab_standard:
                 go.Bar(name='Embodied', x=df_std_grp['Project'], y=df_std_grp['Embodied_gCO2e_tx'], marker_color='#e74c3c')
             ])
             fig_stack_std.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
-            
             std_avg_sci = df_tab2['SCI Score (g CO2e/tx)'].mean()
             if pd.notna(std_avg_sci):
                 fig_stack_std.add_hline(y=std_avg_sci, line_dash="dash", line_color="gray", 
@@ -450,7 +545,7 @@ with tab_ai:
         
         df_display_tab3 = format_dataframe_display(formatted_df_ai[display_cols_ai].sort_values(by="Date", ascending=False))
         if 'Estimated_Cost_$' in df_display_tab3.columns:
-            df_display_tab3['Estimated_Cost_$'] = df_ai_base['Estimated_Cost_$'].apply(lambda x: f"${x:.4f}".replace('.', ','))
+            df_display_tab3['Estimated_Cost_$'] = df_ai_base['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
 
         st.dataframe(df_display_tab3, use_container_width=True)
         st.divider()
@@ -466,9 +561,9 @@ with tab_ai:
         st.subheader("📈 AI Code KPIs")
         a1, a2, a3, a4 = st.columns(4)
         with a1:
-            st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_european(df_tab3["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_number(df_tab3["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
         with a2:
-            st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_european(df_tab3["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_number(df_tab3["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
         with a3:
             st.markdown(f'<div class="metric-card"><h4>Total Tokens</h4><h2>{df_tab3["Total_Tokens"].sum():,.0f}</h2></div>', unsafe_allow_html=True)
         with a4:
@@ -487,57 +582,12 @@ with tab_ai:
         
         st.write("") 
         
-        total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():.4f}".replace('.', ',')
+        total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():,.4f}"
         st.markdown(f'<div class="metric-card-ai" style="text-align: center; margin-bottom: 20px;"><h4>Total FinOps Cost Across All AI Projects</h4><h2 style="font-size: 2.5rem !important;">{total_cost_str}</h2></div>', unsafe_allow_html=True)
         
         cost_agg_proj = df_tab3.groupby('Project')['Estimated_Cost_$'].sum().reset_index()
         fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
         st.plotly_chart(fig_cost_proj, use_container_width=True)
-
-   # =====================================================================
-# FORMATTING HELPERS (Add these at the top of your app.py)
-# =====================================================================
-def format_time_duration(seconds):
-    """Converts seconds into a human-readable compound format (e.g., '1 week and 4 days')"""
-    if seconds <= 0: return "0 seconds"
-    if seconds < 60: return f"{int(seconds)} seconds"
-    
-    minutes = seconds // 60
-    sec_rem = seconds % 60
-    if minutes < 60: 
-        return f"{int(minutes)} minutes" + (f" and {int(sec_rem)} seconds" if sec_rem > 0 else "")
-    
-    hours = seconds // 3600
-    min_rem = (seconds % 3600) // 60
-    if hours < 24: 
-        return f"{int(hours)} hours" + (f" and {int(min_rem)} minutes" if min_rem > 0 else "")
-    
-    days = seconds // 86400
-    hours_rem = (seconds % 86400) // 3600
-    if days < 7: 
-        return f"{int(days)} days" + (f" and {int(hours_rem)} hours" if hours_rem > 0 else "")
-    
-    weeks = seconds // 604800
-    days_rem = (seconds % 604800) // 86400
-    if weeks < 4: 
-        return f"{int(weeks)} weeks" + (f" and {int(days_rem)} days" if days_rem > 0 else "")
-    
-    months = seconds // 2592000 # Approx 30 days
-    weeks_rem = (seconds % 2592000) // 604800
-    if months < 12: 
-        return f"{int(months)} months" + (f" and {int(weeks_rem)} weeks" if weeks_rem > 0 else "")
-    
-    years = seconds // 31536000
-    months_rem = (seconds % 31536000) // 2592000
-    return f"{int(years)} years" + (f" and {int(months_rem)} months" if months_rem > 0 else "")
-
-def format_uk_pct(pct):
-    """Formats percentage with dynamic decimals depending on scale."""
-    if pct == 0: return "0%"
-    elif pct >= 1: return f"{pct:.2f}%"
-    elif pct >= 0.01: return f"{pct:.2f}%" 
-    elif pct >= 0.0001: return f"{pct:.4f}%" 
-    else: return "~0% (negligible fraction)"
 
 # =====================================================================
 # TAB 4: PROJECT DRILL-DOWN 
@@ -558,16 +608,21 @@ with tab_drilldown:
         df_proj['MEASUREMENT_PERIOD'] = df_proj['MEASUREMENT_PERIOD'].fillna(KNOWN_PERIODS.get(selected_proj_drill, "Unknown"))
         period_text = df_proj['MEASUREMENT_PERIOD'].iloc[0]
 
-        # Check if period is mathematically parseable (not unknown)
+        # Check if period is mathematically parseable AND if there is an internal mismatch
         can_normalize = False
-        for idx, row in df_proj.iterrows():
-            if parse_period_to_hours(row['MEASUREMENT_PERIOD']) is not None:
-                can_normalize = True
-                break
+        valid_periods = [p for p in df_proj['MEASUREMENT_PERIOD'].unique() if "unknown" not in str(p).lower() and pd.notna(p)]
+        has_multiple_steps = len(df_proj) > 1
+        has_mixed_periods = len(valid_periods) > 1
+        
+        if has_multiple_steps and has_mixed_periods:
+            for p in valid_periods:
+                if parse_period_to_hours(p) is not None:
+                    can_normalize = True
+                    break
         
         # --- TIME NORMALIZATION ENGINE ---
         if can_normalize and "unknown" not in period_text.lower():
-            df_proj_raw = df_proj.copy() # Keep raw copy for projection chart
+            df_proj_raw = df_proj.copy() 
             
             st.write("")
             st.markdown("### ⏱️ Time Normalization Engine")
@@ -602,16 +657,18 @@ with tab_drilldown:
             with st.expander("📊 View Component Comparison Chart", expanded=False):
                 proj_metric = st.selectbox(
                     "Select metric to compare across components:", 
-                    ["Total Carbon Footprint (g CO2e)", "Energy Consumed - E (kWh)", "Estimated_Cost_$"]
+                    ["Total Carbon Footprint (g CO2e)", "Energy Consumed - E (kWh)", "Estimated_Cost_$", "SCI Score (g CO2e/tx)"]
                 )
                 
                 group_col_compare = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
                 
-                # Group by component using the currently scaled data
-                compare_df = df_proj.groupby(group_col_compare)[proj_metric].sum().reset_index()
+                if "SCI" in proj_metric:
+                    compare_df = df_proj.groupby(group_col_compare)[proj_metric].mean().reset_index()
+                else:
+                    compare_df = df_proj.groupby(group_col_compare)[proj_metric].sum().reset_index()
+                    
                 compare_df = compare_df.sort_values(by=proj_metric, ascending=False)
                 
-                # Dynamic orientation based on item count
                 num_compare_items = len(compare_df)
                 is_horizontal_comp = num_compare_items >= 8
                 comp_orientation = 'h' if is_horizontal_comp else 'v'
@@ -620,12 +677,16 @@ with tab_drilldown:
                 x_ax = proj_metric if is_horizontal_comp else group_col_compare
                 y_ax = group_col_compare if is_horizontal_comp else proj_metric
                 
-                # Use sequential colors depending on the metric
-                color_seq = DARK_BLUES if 'Cost' in proj_metric else DARK_PURPLES
+                if 'Cost' in proj_metric:
+                    color_seq = px.colors.sequential.Blues[::-1]
+                elif 'SCI' in proj_metric:
+                    color_seq = px.colors.sequential.Greens[::-1] 
+                else:
+                    color_seq = px.colors.sequential.Purples[::-1]
                 
                 fig_comp = px.bar(
                     compare_df, x=x_ax, y=y_ax, color=group_col_compare,
-                    title=f"{proj_metric.split(' (')[0]} by Component ({target_scale})", 
+                    title=f"{proj_metric.split(' (')[0]} by Component ({target_scale if 'SCI' not in proj_metric else 'Fixed Ratio'})", 
                     orientation=comp_orientation, height=comp_height,
                     color_discrete_sequence=color_seq
                 )
@@ -647,11 +708,11 @@ with tab_drilldown:
             proj_hotspot = "N/A"
             
         with pm1:
-            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_european(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
         with pm2:
-            st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_european(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
         with pm3:
-            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_european(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
         with pm4:
             st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
         
@@ -661,21 +722,18 @@ with tab_drilldown:
         st.divider()
         st.markdown("### 📊 Benchmark & Real-World Context")
         
-        # 1. Calculate Global SCI Statistics for context (GROUPED BY PROJECT)
         project_avg_scis = filtered_df.groupby('Project')['SCI Score (g CO2e/tx)'].mean()
         global_sci_stats = project_avg_scis.describe()
         global_median_sci = project_avg_scis.median()
         
-        # DISPLAY THE 4 NUMBERS
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Global SCI (Min)", f"{format_european(global_sci_stats['min'])} g/tx")
-        c2.metric("Global SCI (Median)", f"{format_european(global_median_sci)} g/tx")
-        c3.metric("Global SCI (Average)", f"{format_european(global_sci_stats['mean'])} g/tx")
-        c4.metric("Global SCI (Max)", f"{format_european(global_sci_stats['max'])} g/tx")
+        c1.metric("Global SCI (Min)", f"{format_number(global_sci_stats['min'])} g/tx")
+        c2.metric("Global SCI (Median)", f"{format_number(global_median_sci)} g/tx")
+        c3.metric("Global SCI (Average)", f"{format_number(global_sci_stats['mean'])} g/tx")
+        c4.metric("Global SCI (Max)", f"{format_number(global_sci_stats['max'])} g/tx")
         
         st.write("")
         
-        # Explain Absolute vs Intensity comparison dynamically
         col_bench1, col_bench2 = st.columns(2)
         project_totals = filtered_df.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum()
         global_median_carbon = project_totals.median()
@@ -684,17 +742,17 @@ with tab_drilldown:
             st.markdown("**1. Absolute Environmental Impact (Total Carbon)**")
             if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon):
                 if proj_total_carbon > global_median_carbon:
-                    st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_european(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_european(global_median_carbon)} gCO₂e).")
+                    st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
                 else:
-                    st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_european(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_european(global_median_carbon)} gCO₂e).")
+                    st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
         
         with col_bench2:
             st.markdown("**2. Software Code Efficiency (Average SCI)**")
             if pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
                 if proj_avg_sci > global_median_sci:
-                    st.warning(f"⚠️ **Opportunity for Improvement:** This project's intensity per transaction ({format_european(proj_avg_sci)} g/tx) is **higher** than the global median ({format_european(global_median_sci)} g/tx).")
+                    st.warning(f"⚠️ **Opportunity for Improvement:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **higher** than the global median ({format_number(global_median_sci)} g/tx).")
                 else:
-                    st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_european(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_european(global_median_sci)} g/tx).")
+                    st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_number(global_median_sci)} g/tx).")
 
         st.caption("*Note: A project like a high-traffic AI model might have a large Total Carbon footprint due to high user demand, while maintaining a highly efficient SCI score per request.*")
         
@@ -735,16 +793,13 @@ with tab_drilldown:
         # 2. Real World Equivalents & Intensity Context
         st.markdown("#### 🌍 Real-World Equivalents & Intensity Context")
         
-        # Intensity Context (SCI)
         if is_ai_proj:
-            st.info(f"💡 **Intensity Context (AI):** This project's average SCI is **{format_european(proj_avg_sci)} gCO₂e/tx**. For comparison, an average ChatGPT or Gemini text prompt emits between **2.0 and 3.0 gCO₂e**.")
+            st.info(f"💡 **Intensity Context (AI):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, an average ChatGPT or Gemini text prompt emits between **2.0 and 3.0 gCO₂e**.")
         else:
-            st.info(f"💡 **Intensity Context (Standard):** This project's average SCI is **{format_european(proj_avg_sci)} gCO₂e/tx**. For comparison, a standard Google web search emits roughly **0.2 gCO₂e**.")
+            st.info(f"💡 **Intensity Context (Standard):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, a standard Google web search emits roughly **0.2 gCO₂e**.")
 
-        # Total Impact Context (Energy & Carbon)
         if proj_total_energy > 0 or proj_total_carbon > 0:
             if is_ai_proj:
-                # AI Context 
                 total_wh = proj_total_energy * 1000
                 gemini_queries_eq = total_wh / 0.24 if total_wh > 0 else 0
                 
@@ -755,30 +810,28 @@ with tab_drilldown:
                 fridge_str = format_time_duration(fridge_seconds)
                 
                 st.info(
-                    f"💡 **Energy Context (AI):** The {format_european(proj_total_energy)} kWh used by this project equals **{format_european(total_wh)} Wh**. "
+                    f"💡 **Energy Context (AI):** The {format_number(proj_total_energy)} kWh used by this project equals **{format_number(total_wh)} Wh**. "
                     f"According to recent Google estimates, a standard Gemini text query uses 0.24 Wh. "
                     f"This project's total energy is equivalent to running a microwave for **{microwave_str}** or a standard fridge for **{fridge_str}**."
                 )
             else:
-                # Standard Context (Non-AI) with small impact protection
                 if proj_total_carbon < 8.0:
-                    st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
+                    st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
                 else:
                     smartphones = int(proj_total_carbon / 8.0)
                     km_driven = proj_total_carbon / 192.0
                     
                     if km_driven < 1:
-                        st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
                     else:
-                        st.info(f"💡 **Energy Context (Standard Code):** The {format_european(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{smartphones} smartphones**.")
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**.")
                 
-            # Shared Carbon Context applied to BOTH AI and Non-AI
             uk_annual_carbon_g = 7000000.0 # 7 tonnes
             pct_of_uk_citizen = (proj_total_carbon / uk_annual_carbon_g) * 100
             
             st.info(
                 f"💡 **Carbon Context:** The average UK citizen emits 7 tonnes of CO₂ annually from energy and industry. "
-                f"This project's total footprint ({format_european(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
+                f"This project's total footprint ({format_number(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
             )
         else:
             st.info("💡 **Context:** The recorded energy and carbon totals for this timeframe are currently **0**. Process more data to see real-world equivalents.")
@@ -797,7 +850,11 @@ with tab_drilldown:
                 "**Proxy Model Estimation (Archimedes Lever):**\n\n"
                 "The baseline telemetry for this project was originally recorded using Anthropic's 'Opus 5'. "
                 "Since this specific model version is not yet supported by standard carbon tracking APIs, "
-                "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model."
+                "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model.\n\n"
+                "**Why Claude 3 Opus?**\n"
+                "We selected this model because it belongs to the same flagship 'Opus' architectural tier. "
+                "It shares the closest parameter scale, computational density, and hardware utilization profile. "
+                "Consequently, its energy consumption per token (Wh/token) provides the most mathematically accurate baseline available to estimate the carbon emissions of a next-generation Opus model."
             )
         
         df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
@@ -820,7 +877,7 @@ with tab_drilldown:
         
         formatted_breakdown = format_dataframe_display(breakdown_table)
         if 'Estimated_Cost_$' in formatted_breakdown.columns:
-            formatted_breakdown['Estimated_Cost_$'] = breakdown_table['Estimated_Cost_$'].apply(lambda x: f"${x:.4f}".replace('.', ','))
+            formatted_breakdown['Estimated_Cost_$'] = breakdown_table['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
             
         st.dataframe(formatted_breakdown, use_container_width=True)
         
@@ -830,10 +887,13 @@ with tab_drilldown:
         else:
             chart_df = df_proj.copy()
             
+        # --- PREPARING DATA FOR BREAKDOWN CHARTS ---
         group_col_chart = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
+        
         breakdown_chart = chart_df.groupby(group_col_chart).agg({
             'Total Carbon Footprint (g CO2e)': 'sum',
-            'Estimated_Cost_$': 'sum'
+            'Estimated_Cost_$': 'sum',
+            'SCI Score (g CO2e/tx)': 'mean'
         }).reset_index().rename(columns={group_col_chart: 'Component / Step'})
 
         num_items = len(breakdown_chart)
@@ -849,16 +909,31 @@ with tab_drilldown:
         x_cost = 'Estimated_Cost_$' if is_horizontal else 'Component / Step'
         y_cost = 'Component / Step' if is_horizontal else 'Estimated_Cost_$'
 
+        x_sci = 'SCI Score (g CO2e/tx)' if is_horizontal else 'Component / Step'
+        y_sci = 'Component / Step' if is_horizontal else 'SCI Score (g CO2e/tx)'
+
         st.write("") 
 
+        # 1. Gráfico de Impacto Absoluto (Carbono)
         fig_drill_carbon = px.bar(
             breakdown_chart, x=x_carbon, y=y_carbon, color='Component / Step',
-            title="Carbon Impact Breakdown", 
+            title="Carbon Impact Breakdown (Total gCO₂e)", 
             orientation=orientation_flag, height=dynamic_chart_height,
             color_discrete_sequence=DARK_PURPLES
         )
         st.plotly_chart(fig_drill_carbon, use_container_width=True)
         
+        # 2. Gráfico de Intensidad (Eficiencia de código - SCI)
+        breakdown_chart_sci = breakdown_chart.sort_values(by='SCI Score (g CO2e/tx)', ascending=is_horizontal)
+        fig_drill_sci = px.bar(
+            breakdown_chart_sci, x=x_sci, y=y_sci, color='Component / Step',
+            title="Intensity Impact Breakdown (Average SCI - gCO₂e/tx)", 
+            orientation=orientation_flag, height=dynamic_chart_height,
+            color_discrete_sequence=px.colors.sequential.Greens[::-1]  
+        )
+        st.plotly_chart(fig_drill_sci, use_container_width=True)
+
+        # 3. Gráfico de Costes (Solo para IA)
         if is_ai_proj:
             fig_drill_cost = px.bar(
                 breakdown_chart, x=x_cost, y=y_cost, color='Component / Step',
@@ -918,14 +993,14 @@ with tab_drilldown:
             carbon_saved = pre_carbon_total - post_carbon_total
             carbon_pct = (carbon_saved / pre_carbon_total * 100) if pre_carbon_total > 0 else 0
             
-            carbon_saved_str = format_european(carbon_saved)
-            carbon_pct_str = format_european(-carbon_pct)
+            carbon_saved_str = format_number(carbon_saved)
+            carbon_pct_str = format_number(-carbon_pct)
             
             if is_ai_proj:
                 cost_saved = pre_cost_total - post_cost_total
                 cost_pct = (cost_saved / pre_cost_total * 100) if pre_cost_total > 0 else 0
-                cost_saved_str = format_european(cost_saved)
-                cost_pct_str = format_european(-cost_pct)
+                cost_saved_str = format_number(cost_saved)
+                cost_pct_str = format_number(-cost_pct)
                 
                 m1, m2 = st.columns(2)
                 m1.metric("Total Carbon Reduction", f"{carbon_saved_str} gCO₂e", f"{carbon_pct_str}%", delta_color="inverse")
@@ -939,9 +1014,9 @@ with tab_drilldown:
                 
                 if carbon_saved >= 192.0:
                     km_driven = carbon_saved / 192.0 
-                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_european(km_driven)} km** or charging **{smartphones} smartphones**!")
+                    st.info(f"💡 The **{format_number(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**!")
                 else:
-                    st.info(f"💡 The **{format_european(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{smartphones} smartphones**!")   
+                    st.info(f"💡 The **{format_number(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{smartphones} smartphones**!")   
             
             pre_steps = set(df_pre['Clean_Step'].unique())
             post_steps = set(df_post['Clean_Step'].unique())
@@ -964,7 +1039,6 @@ with tab_drilldown:
                 
                 cols = st.columns(3) 
                 col_idx = 0
-                
                 for step, metrics in step_results.items():
                     with cols[col_idx % 3]:
                         with st.container(border=True):
@@ -984,8 +1058,8 @@ with tab_drilldown:
                                 step_cost_saved = step_pre_cost - step_post_cost
                                 step_cost_pct = (step_cost_saved / step_pre_cost * 100) if step_pre_cost > 0 else 0
                                 
-                                st.metric("Carbon Reduction", f"{format_european(metrics['saved'])} gCO₂e", f"{format_european(-metrics['pct'])}%", delta_color="inverse")
-                                st.metric("FinOps Savings", f"${format_european(step_cost_saved)}", f"{format_european(-step_cost_pct)}%", delta_color="inverse")
+                                st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
+                                st.metric("FinOps Savings", f"${format_number(step_cost_saved)}", f"{format_number(-step_cost_pct)}%", delta_color="inverse")
                             else:
-                                st.metric("Carbon Reduction", f"{format_european(metrics['saved'])} gCO₂e", f"{format_european(-metrics['pct'])}%", delta_color="inverse")
+                                st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
                     col_idx += 1
