@@ -32,7 +32,8 @@ def init_local_db(db_path: str = DB_FILE):
             PROMPT_TOKENS INTEGER DEFAULT 0,
             COMPLETION_TOKENS INTEGER DEFAULT 0,
             IS_SYNCED INTEGER DEFAULT 0,
-            MEASUREMENT_PERIOD TEXT
+            MEASUREMENT_PERIOD TEXT,
+            PROVIDER TEXT DEFAULT 'Unknown'
         )
     """)
     
@@ -44,6 +45,11 @@ def init_local_db(db_path: str = DB_FILE):
         
     try:
         cursor.execute("ALTER TABLE CO_SOFTWARE_CARBON_INTENSITY ADD COLUMN MEASUREMENT_PERIOD TEXT")
+    except sqlite3.OperationalError:
+        pass 
+        
+    try:
+        cursor.execute("ALTER TABLE CO_SOFTWARE_CARBON_INTENSITY ADD COLUMN PROVIDER TEXT DEFAULT 'Unknown'")
     except sqlite3.OperationalError:
         pass 
         
@@ -63,23 +69,24 @@ class GreenLogger:
         self, 
         project_id: str, 
         step_name: str, 
-        functional_unit_name: str, # MANDATORY: No default value allowed
-        functional_units: int,     # MANDATORY: No default value allowed
+        functional_unit_name: str, 
+        functional_units: int,     
         is_ai: bool = False,
         model_name: str = "gpt-4o-mini",
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
-        measurement_period: str = None,  # Optional explicit timeframe (e.g., "1 Month")
+        measurement_period: str = None,  
+        provider: str = "Unknown",       # Cloud provider (e.g., AWS, GCP, Azure, On-Premise)
         db_path: str = DB_FILE
     ):
-        # Strict validation for functional_unit_name to prevent lazy generic labels
+        # Strict validation for functional_unit_name 
         if not functional_unit_name or functional_unit_name.strip().lower() in ["", "transaction", "test"]:
             raise ValueError(
                 "🚨 GREEN OPS ERROR: You must specify a real 'functional_unit_name' for your project "
-                "(e.g., 'pipeline execution', 'API request', 'CSV rows'). Check the SCI documentation."
+                "(e.g., 'pipeline execution', 'API request', 'CSV rows')."
             )
             
-        # Strict validation for functional_units to prevent ZeroDivisionError and enforce conscious measurement
+        # Strict validation for functional_units to prevent ZeroDivisionError 
         if not isinstance(functional_units, int) or functional_units <= 0:
             raise ValueError(
                 "🚨 GREEN OPS ERROR: 'functional_units' must be an integer greater than 0. "
@@ -94,7 +101,8 @@ class GreenLogger:
         self.model_name = model_name
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
-        self.measurement_period = measurement_period # Can be None if realtime tracking is desired
+        self.measurement_period = measurement_period 
+        self.provider = provider
         self.db_path = db_path
         
         # Initialize CodeCarbon tracker only for local non-AI execution
@@ -123,7 +131,7 @@ class GreenLogger:
                 if hasattr(self.tracker, 'final_emissions_data') and self.tracker.final_emissions_data 
                 else 0.0
             )
-            M_allocated = 0.05 * execution_time_seconds  # Estimated embodied carbon allocation based on execution time
+            M_allocated = 0.05 * execution_time_seconds  # Estimated embodied carbon 
         else:
             # 2. AI / LLM Inference Execution (SCI for AI via EcoLogits proxy)
             energy_kwh, carbon_g = self._fetch_ecologits_impact()
@@ -135,7 +143,7 @@ class GreenLogger:
         project_hash = hashlib.md5(self.project_id.encode('utf-8')).hexdigest()[:8]
         tracker_id = f"{self.project_id}-{project_hash}"
 
-        # TIME LOGIC: Use explicit measurement window if provided, otherwise fallback to script execution time
+        # TIME LOGIC: explicit measurement window or script execution time
         final_period = self.measurement_period
         if final_period is None:
             if execution_time_seconds >= 60:
@@ -160,14 +168,15 @@ class GreenLogger:
             "AI_MODEL_NAME": self.model_name if self.is_ai else None,
             "PROMPT_TOKENS": int(self.prompt_tokens) if self.is_ai else 0,
             "COMPLETION_TOKENS": int(self.completion_tokens) if self.is_ai else 0,
-            "MEASUREMENT_PERIOD": final_period
+            "MEASUREMENT_PERIOD": final_period,
+            "PROVIDER": self.provider
         }
 
         # Directly save payload into local SQLite database
         self._save_to_local_db(payload)
 
     def _save_to_local_db(self, payload: dict):
-        """Persists SCI metrics directly to SQLite database file without network requests."""
+        """Persists SCI metrics directly to SQLite database file."""
         try:
             init_local_db(self.db_path)
             conn = sqlite3.connect(self.db_path)
@@ -178,13 +187,13 @@ class GreenLogger:
                     EFFECTIVE_DATE, EMBODIED_EMISSIONS_GCO2E, ENERGY_CONSUMED_KWH, 
                     EXECUTION_DATE, FUNCTIONAL_UNIT_TX, FUNCTIONAL_UNIT_NAME, PROCESS_DESC, PROJECT_NAME, 
                     REGION, SCI_SCORE_GCO2E_TX, SCI_TRACKER_ID, TOTAL_CARBON_FOOTPRINT_GCO2E,
-                    IS_AI, AI_MODEL_NAME, PROMPT_TOKENS, COMPLETION_TOKENS, IS_SYNCED, MEASUREMENT_PERIOD
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    IS_AI, AI_MODEL_NAME, PROMPT_TOKENS, COMPLETION_TOKENS, IS_SYNCED, MEASUREMENT_PERIOD, PROVIDER
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """, (
                 payload["EFFECTIVE_DATE"], payload["EMBODIED_EMISSIONS_GCO2E"], payload["ENERGY_CONSUMED_KWH"],
                 payload["EXECUTION_DATE"], payload["FUNCTIONAL_UNIT_TX"], payload["FUNCTIONAL_UNIT_NAME"], payload["PROCESS_DESC"], payload["PROJECT_NAME"],
                 payload["REGION"], payload["SCI_SCORE_GCO2E_TX"], payload["SCI_TRACKER_ID"], payload["TOTAL_CARBON_FOOTPRINT_GCO2E"],
-                payload["IS_AI"], payload["AI_MODEL_NAME"], payload["PROMPT_TOKENS"], payload["COMPLETION_TOKENS"], payload["MEASUREMENT_PERIOD"]
+                payload["IS_AI"], payload["AI_MODEL_NAME"], payload["PROMPT_TOKENS"], payload["COMPLETION_TOKENS"], payload["MEASUREMENT_PERIOD"], payload["PROVIDER"]
             ))
             conn.commit()
             conn.close()
