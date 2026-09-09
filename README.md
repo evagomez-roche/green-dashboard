@@ -9,10 +9,10 @@ $SCI = \frac{(E \cdot I) + M}{R}$
 
 You do not need to set up complex infrastructure or connect to an external API. The SDK runs locally and stores data in a local SQLite database.
 
-1. Place the `roche_green_sdk` folder into the root directory of your project.
+1. Place the `green-dashboard-main` folder into the root directory of your project.
 2. Open your terminal in that directory and install the package locally by running:
    ```bash
-   pip install -e ./roche_green_sdk
+   pip install -e ./green-dashboard-main
    ```
 
 *(This will automatically install the required dependencies: `codecarbon` and `requests`).*
@@ -26,7 +26,7 @@ Import `GreenLogger` in your main script and wrap the function or process you wa
 This measures the actual CPU and RAM energy consumption on your local machine.
 
 ```python
-from roche_green.logger import GreenLogger
+from green_logger import GreenLogger
 
 # Define how many units you are processing (e.g., CSV rows, transactions)
 records_processed = 5000
@@ -47,7 +47,7 @@ with GreenLogger(
 AI inference energy consumption happens in the cloud. The SDK uses EcoLogits to estimate the environmental impact on the servers based on the chosen model and the tokens used.
 
 ```python
-from roche_green.logger import GreenLogger
+from green_logger import GreenLogger
 
 # 1. Execute your AI call (Groq, OpenAI, etc.)
 response = ai_client.generate_text(prompt="Summarize this document")
@@ -83,14 +83,20 @@ Accepted formats: `"X Minutes"`, `"X Hours"`, `"X Days"`, `"X Months"`, `"X Year
 **Example for Historical Data:**
 
 ```python
-with GreenLogger(
+from green_logger import GreenLogger
+
+# Initialize logger for historical/batch data
+logger = GreenLogger(
     project_id="myCO2", 
     step_name="DWH_Compute", 
     functional_unit_name="queries", 
     functional_units=5000, 
     measurement_period="1 Month"  # <--- CRITICAL FOR ACCURATE DASHBOARD SCALING
-):
+)
     # Your log parsing / batch processing code here
+    parse_historical_logs()
+    # Log metrics to telemetry file
+    logger.log_metrics()
 ```
 
 ## 3. 📏 How to define your Functional Unit (`functional_units`)
