@@ -198,6 +198,16 @@ def format_uk_pct(pct):
     elif pct >= 0.0001: return f"{pct:.4f}%" 
     else: return "~0% (negligible fraction)"
 
+def get_equivalence_1000_prompts(wh_tx, ml_tx):
+    tot_wh = wh_tx * 1000
+    tot_ml = ml_tx * 1000
+    tot_co2 = (tot_wh / 1000) * 300 # Standard 300g/kWh for cloud
+    
+    phones = int(tot_wh / 15) if tot_wh >= 15 else (tot_wh / 15)
+    meters_driven = (tot_co2 / 120) * 1000
+    glasses = tot_ml / 250
+    return phones, meters_driven, glasses, tot_co2, tot_ml
+
 # =====================================================================
 # DATA LOADING & COST CALCULATION
 # =====================================================================
@@ -351,16 +361,17 @@ filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZ
 # =====================================================================
 # TABS SETUP
 # =====================================================================
-tab_global, tab_standard, tab_ai, tab_water, tab_drilldown = st.tabs([
+tab_global, tab_standard, tab_ai, tab_water, tab_drilldown, tab_insights = st.tabs([
     "🌍 Global Overview", 
     "💻 SCI (Standard Code)", 
     "🧠 SCI for AI (Models & Costs)", 
     "💧 Water Footprint",
-    "🔍 Project Drill-down"
+    "🔍 Project Drill-down",
+    "💡 AI Models Benchmark"
 ])
 
 # =====================================================================
-# TAB 1: GLOBAL OVERVIEW (With Run Rate Normalization)
+# TAB 1: GLOBAL OVERVIEW
 # =====================================================================
 with tab_global:
     st.subheader("🌍 Global Impact Overview (Run Rate Projection)")
@@ -372,7 +383,6 @@ with tab_global:
         horizontal=True,
         key="global_scale"
     )
-    
     scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
     df_global_scaled = filtered_df.copy()
     
@@ -501,7 +511,6 @@ with tab_standard:
         df_display_tab2 = format_dataframe_display(df_std_base[display_cols_std].sort_values(by="Date", ascending=False))
         st.dataframe(df_display_tab2, use_container_width=True)
         st.divider()
-
         tab2_phases = st.multiselect(
             "⚖️ Select Phase (Filters KPIs and charts below):", 
             options=["Baseline (Pre)", "Optimized (Post)"],
@@ -626,6 +635,7 @@ with tab_water:
     st.markdown("""
     *Calculates direct water consumption in data centers based on Energy (kWh) and verified provider Water Usage Effectiveness (WUE).*
     """)
+    st.info("**What is Level 1 Water?** It refers to the direct on-site water evaporated by the cooling towers inside the hyperscale data center to keep the servers from overheating. It does not include Level 2 indirect water (e.g., water used by power plants to generate the electricity).")
     
     df_water = filtered_df.copy()
     
@@ -701,29 +711,47 @@ with tab_water:
             'Water_Intensity_ml_tx': 'mean'
         }).reset_index().rename(columns={group_col_w: 'Component / Step'})
 
+        # Implement TOP-10 logic for projects with many steps
+        comp_w_df = comp_w_df.sort_values('Water_Consumed_Liters', ascending=False)
         num_steps = len(comp_w_df)
 
-        # --- DYNAMIC CHART LAYOUT ---
-        dynamic_height = max(450, num_steps * 25) # Escala 25px por cada componente extra
+        if num_steps > 10:
+            top_10 = comp_w_df.head(10)
+            others_water = comp_w_df.iloc[10:]['Water_Consumed_Liters'].sum()
+            others_int = comp_w_df.iloc[10:]['Water_Intensity_ml_tx'].mean()
+            others_row = pd.DataFrame({
+                'Component / Step': [f'Others ({num_steps - 10} steps)'],
+                'Water_Consumed_Liters': [others_water],
+                'Water_Intensity_ml_tx': [others_int]
+            })
+            comp_w_df_chart = pd.concat([top_10, others_row], ignore_index=True)
+            top_10_pct = (top_10['Water_Consumed_Liters'].sum() / proj_total_water) * 100 if proj_total_water > 0 else 0
+            st.caption(f"**Top-10 Optimization:** Displaying the top 10 consumers, which represent **{top_10_pct:.1f}%** of the total water footprint. The remaining {num_steps - 10} steps are aggregated as 'Others'.")
+        else:
+            comp_w_df_chart = comp_w_df.copy()
 
-        if num_steps > 5:
+        # --- DYNAMIC CHART LAYOUT ---
+        chart_items = len(comp_w_df_chart)
+        dynamic_height = max(450, chart_items * 35)
+
+        if chart_items > 5:
             # HORIZONTAL LAYOUT (Stacked vertically)
             fig_w_tot = px.bar(
-                comp_w_df.sort_values('Water_Consumed_Liters', ascending=True), 
+                comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=True), 
                 x='Water_Consumed_Liters', y='Component / Step', 
                 title="Total Absolute Water (Liters)", 
                 orientation='h',
-                height=dynamic_height, # <--- Parámetro añadido
+                height=dynamic_height,
                 color_discrete_sequence=['#3498db']
             )
             st.plotly_chart(fig_w_tot, use_container_width=True)
             
             fig_w_int = px.bar(
-                comp_w_df.sort_values('Water_Intensity_ml_tx', ascending=True), 
+                comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=True), 
                 x='Water_Intensity_ml_tx', y='Component / Step', 
                 title="Water Efficiency (ml per transaction)", 
                 orientation='h',
-                height=dynamic_height, # <--- Parámetro añadido
+                height=dynamic_height,
                 color_discrete_sequence=['#2980b9']
             )
             st.plotly_chart(fig_w_int, use_container_width=True)
@@ -733,7 +761,7 @@ with tab_water:
             col_w_chart1, col_w_chart2 = st.columns(2)
             with col_w_chart1:
                 fig_w_tot = px.bar(
-                    comp_w_df.sort_values('Water_Consumed_Liters', ascending=False), 
+                    comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=False), 
                     x='Component / Step', y='Water_Consumed_Liters', 
                     title="Total Absolute Water (Liters)", 
                     orientation='v',
@@ -743,13 +771,37 @@ with tab_water:
                 
             with col_w_chart2:
                 fig_w_int = px.bar(
-                    comp_w_df.sort_values('Water_Intensity_ml_tx', ascending=False), 
+                    comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=False), 
                     x='Component / Step', y='Water_Intensity_ml_tx', 
                     title="Water Efficiency (ml per transaction)", 
                     orientation='v',
                     color_discrete_sequence=['#2980b9']
                 )
                 st.plotly_chart(fig_w_int, use_container_width=True)
+
+        # --- AUTOMATED INSIGHTS GENERATOR (APPLES-TO-APPLES) ---
+        st.write("")
+        st.markdown("#### 💧 Automated Water Efficiency Insights")
+        if not comp_w_df.empty and len(comp_w_df) > 1:
+            # Emphasize that intensity (ml/tx) is the true efficiency metric
+            best_idx = comp_w_df['Water_Intensity_ml_tx'].idxmin()
+            worst_idx = comp_w_df['Water_Intensity_ml_tx'].idxmax()
+            
+            if pd.notna(best_idx) and pd.notna(worst_idx):
+                best_row = comp_w_df.loc[best_idx]
+                worst_row = comp_w_df.loc[worst_idx]
+                
+                best_ml = best_row['Water_Intensity_ml_tx']
+                worst_ml = worst_row['Water_Intensity_ml_tx']
+                
+                multiplier = (worst_ml / best_ml) if best_ml > 0 else 0
+                mult_str = f"**{multiplier:.1f}x more**" if multiplier > 0 else "significantly more"
+                
+                st.info(f"💡 **Apples-to-Apples Comparison:** To truly understand efficiency, we must look at the cost per transaction. "
+                        f"**'{best_row['Component / Step']}'** is your greenest and most efficient component here, evaporating only **{format_number(best_ml)} ml** per prompt. "
+                        f"Conversely, **'{worst_row['Component / Step']}'** is the most water-intensive, consuming **{format_number(worst_ml)} ml** per prompt "
+                        f"({mult_str} than the most efficient one).\n\n"
+                        f"*Note: A high 'Total Absolute Water' bar just means a component is called frequently, but intensity (ml/tx) reveals its architectural efficiency.*")
 
     st.divider()
     
@@ -760,7 +812,7 @@ with tab_water:
         1. **Cloud Efficiency (WUE):** AI models typically run on hyperscale cloud providers (AWS, GCP) with highly optimized liquid cooling (WUE ~0.20 L/kWh). Standard code often runs on legacy or on-premise servers with less efficient cooling (WUE ~1.80 L/kWh).
         2. **Transaction Volume (The Denominator):** AI pipelines often process millions of tokens (transactions), mathematically diluting the water cost per single transaction, whereas a standard script might execute once but take minutes to run.
         """)
-        
+    
     df_water['Workload_Type'] = df_water['IS_AI'].apply(lambda x: "AI Project" if x == 1 else "Standard Software")
     comp_water_df = df_water.groupby('Workload_Type')['Water_Intensity_ml_tx'].mean().reset_index()
     
@@ -781,6 +833,7 @@ with tab_water:
     water_display_cols = ['Project', 'PROCESS_DESC', 'AI_MODEL_NAME', 'PROVIDER', 'WUE (L/kWh)', 'Energy Consumed - E (kWh)', 'Water_Consumed_Liters', 'Water_Intensity_ml_tx']
     valid_w_cols = [c for c in water_display_cols if c in df_water.columns]
     st.dataframe(format_dataframe_display(df_water[valid_w_cols]), use_container_width=True)
+
 
 # =====================================================================
 # TAB 5: PROJECT DRILL-DOWN
@@ -902,6 +955,21 @@ with tab_drilldown:
         with pm4:
             st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
         
+        # Integrate Project-Level Water KPIs here
+        st.write("")
+        df_proj_w = df_proj.copy()
+        df_proj_w['WUE (L/kWh)'] = df_proj_w['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
+        df_proj_w['Water_Consumed_Liters'] = df_proj_w['Energy Consumed - E (kWh)'] * df_proj_w['WUE (L/kWh)']
+        proj_total_water = df_proj_w['Water_Consumed_Liters'].sum()
+        df_proj_w['Water_Intensity_ml_tx'] = (df_proj_w['Water_Consumed_Liters'] * 1000) / df_proj_w['Functional Unit - R (Transactions)'].replace(0, 1)
+        proj_avg_water_int = df_proj_w['Water_Intensity_ml_tx'].mean()
+        
+        pw1, pw2 = st.columns(2)
+        with pw1:
+            st.markdown(f'<div class="metric-card-water"><h4>Total Water Evaporated</h4><h2>{format_number(proj_total_water)} Liters</h2></div>', unsafe_allow_html=True)
+        with pw2:
+            st.markdown(f'<div class="metric-card-water"><h4>Avg. Water Intensity</h4><h2>{format_number(proj_avg_water_int)} ml/tx</h2></div>', unsafe_allow_html=True)
+
         st.write("")
         st.divider()
         st.markdown("### 📊 Benchmark & Real-World Context")
@@ -938,7 +1006,6 @@ with tab_drilldown:
                     st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_number(global_median_sci)} g/tx).")
 
         st.caption("*Note: A project like a high-traffic AI model might have a large Total Carbon footprint due to high user demand, while maintaining a highly efficient SCI score per request.*")
-        
         st.write("")
         st.markdown("#### 🧠 Executive Insight")
         
@@ -1238,3 +1305,106 @@ with tab_drilldown:
                             else:
                                 st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
                     col_idx += 1
+
+# =====================================================================
+# TAB 6: AI MODELS BENCHMARK & INSIGHTS
+# =====================================================================
+with tab_insights:
+    st.subheader("💡 AI Models Benchmark & Insights")
+    st.markdown("Analyze raw environmental performance across all AI models irrespective of the specific project to inform architectural decisions.")
+    
+    df_ai_ins = filtered_df[filtered_df['IS_AI'] == 1].copy()
+    
+    if df_ai_ins.empty:
+        st.info("No AI telemetry found to generate benchmark insights.")
+    else:
+        # Calculate water metrics for all AI rows
+        df_ai_ins['WUE (L/kWh)'] = df_ai_ins['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
+        df_ai_ins['Water_Consumed_Liters'] = df_ai_ins['Energy Consumed - E (kWh)'] * df_ai_ins['WUE (L/kWh)']
+        
+        # Group by the normalized AI model name
+        model_stats = df_ai_ins.groupby('Join_Key').agg({
+            'Energy Consumed - E (kWh)': 'sum',
+            'Water_Consumed_Liters': 'sum',
+            'Functional Unit - R (Transactions)': 'sum',
+            'Estimated_Cost_$': 'sum'
+        }).reset_index()
+        
+        # Calculate strict intensity metrics (Wh/tx and ml/tx)
+        model_stats['Energy_Intensity_Wh_tx'] = (model_stats['Energy Consumed - E (kWh)'] * 1000) / model_stats['Functional Unit - R (Transactions)'].replace(0, 1)
+        model_stats['Water_Intensity_ml_tx'] = (model_stats['Water_Consumed_Liters'] * 1000) / model_stats['Functional Unit - R (Transactions)'].replace(0, 1)
+        
+        # Filter valid interactions
+        model_stats = model_stats[model_stats['Functional Unit - R (Transactions)'] > 0]
+        
+        if not model_stats.empty:
+            model_stats = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'])
+            
+            greenest = model_stats.head(3)
+            worst = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'], ascending=False).head(3)
+            
+            st.markdown("### 🏆 Top Greenest Models (Most Efficient)")
+            g_cols = st.columns(len(greenest))
+            for idx, row in enumerate(greenest.itertuples()):
+                with g_cols[idx]:
+                    st.markdown(
+                        f'<div class="metric-card"><h4>{row.Join_Key.upper()}</h4>'
+                        f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
+                        f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
+                        unsafe_allow_html=True
+                    )
+                    # Real world equivalent per 1000 requests
+                    phones, meters, glasses, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
+                    with st.expander("🌍 Impact of 1,000 prompts"):
+                        st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
+                        st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{meters:.1f}** meters driven\n- 🚰 **{glasses:.1f}** glasses of water")
+                    
+            st.write("")
+            st.markdown("### 🚨 Most Intensive Models (Heavy Footprint)")
+            w_cols = st.columns(len(worst))
+            for idx, row in enumerate(worst.itertuples()):
+                with w_cols[idx]:
+                    st.markdown(
+                        f'<div class="metric-card-danger"><h4>{row.Join_Key.upper()}</h4>'
+                        f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
+                        f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
+                        unsafe_allow_html=True
+                    )
+                    # Real world equivalent per 1000 requests
+                    phones, meters, glasses, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
+                    with st.expander("🌍 Impact of 1,000 prompts"):
+                        st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
+                        st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{meters:.1f}** meters driven\n- 🚰 **{glasses:.1f}** glasses of water")
+                    
+            st.divider()
+            
+            # FULL RANKING TABLE WITH PROGRESS BARS
+            with st.expander("📊 View Full AI Models Ranking (Best to Worst)", expanded=False):
+                st.caption("All tested AI models sorted by architectural energy intensity (Wh per transaction).")
+                
+                max_e = model_stats['Energy_Intensity_Wh_tx'].max()
+                max_w = model_stats['Water_Intensity_ml_tx'].max()
+                
+                st.dataframe(
+                    model_stats[['Join_Key', 'Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx']],
+                    column_config={
+                        "Join_Key": "Model Name",
+                        "Energy_Intensity_Wh_tx": st.column_config.ProgressColumn(
+                            "Energy Intensity (Wh/tx)", 
+                            format="%.4f Wh", 
+                            min_value=0, 
+                            max_value=max_e
+                        ),
+                        "Water_Intensity_ml_tx": st.column_config.ProgressColumn(
+                            "Water Intensity (ml/tx)", 
+                            format="%.4f ml", 
+                            min_value=0, 
+                            max_value=max_w
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            st.markdown("### 🎯 Actionable Recommendations")
+            st.success("**Recommendation:** Whenever possible, fallback to smaller, purpose-built models like **Claude 3.5 Haiku** or **GPT-4o-mini** instead of their heavier counterparts (Sonnet/Opus/GPT-4) for summarization, RAG, or routing tasks. These lightweight models are heavily optimized by hyperscalers, typically operating up to **4x more energy-efficiently** and evaporating up to **80% less direct water** per prompt. Only default to high-intensity models for complex reasoning or highly creative tasks.")
