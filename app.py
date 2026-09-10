@@ -257,6 +257,17 @@ def process_dataframe(df):
         df['FUNCTIONAL_UNIT_NAME'] = 'transaction'
     else:
         df['FUNCTIONAL_UNIT_NAME'] = df['FUNCTIONAL_UNIT_NAME'].fillna('transaction')
+        
+    if 'MEASUREMENT_METHOD' not in df.columns:
+        df['MEASUREMENT_METHOD'] = 'legacy_v1_data'
+    else:
+        df['MEASUREMENT_METHOD'] = df['MEASUREMENT_METHOD'].fillna('legacy_v1_data')
+        
+    # INJECT SDK_VERSION dynamically for backwards compatibility in UI
+    if 'SDK_VERSION' not in df.columns:
+        df['SDK_VERSION'] = 'v1.0.0'
+    else:
+        df['SDK_VERSION'] = df['SDK_VERSION'].fillna('v1.0.0')
 
     # INFER PROVIDER LOGIC BASED ON AI MODEL NAME
     def infer_provider(row):
@@ -418,7 +429,7 @@ with tab_global:
     
     other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
     display_cols.extend([c for c in other_cols if c in df_global_scaled.columns])
-    display_cols.extend([col for col in df_global_scaled.columns if col not in display_cols and col != 'Join_Key'])
+    display_cols.extend([col for col in df_global_scaled.columns if col not in display_cols and col != 'Join_Key' and col != 'MEASUREMENT_METHOD'])
     
     df_display_tab1 = format_dataframe_display(df_global_scaled[display_cols].sort_values(by="Date", ascending=False))
     st.dataframe(df_display_tab1, use_container_width=True)
@@ -577,7 +588,7 @@ with tab_ai:
         other_cols_ai = ['Total_Tokens', 'Total Carbon Footprint (g CO2e)', 'Estimated_Cost_$']
         display_cols_ai.extend([c for c in other_cols_ai if c in df_ai_base.columns])
         
-        display_cols_ai.extend([c for c in df_ai_base.columns if c not in display_cols_ai and c != 'Join_Key'])
+        display_cols_ai.extend([c for c in df_ai_base.columns if c not in display_cols_ai and c != 'Join_Key' and c != 'MEASUREMENT_METHOD'])
         
         formatted_df_ai = df_ai_base.copy()
         
@@ -845,6 +856,30 @@ with tab_drilldown:
     df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
     if not df_proj.empty:
         is_ai_proj = df_proj['IS_AI'].any()
+        
+        # --- DATA QUALITY WARNING SYSTEM ---
+        problematic_methods = df_proj['MEASUREMENT_METHOD'].dropna().unique()
+        has_tdp_fallback = any("tdp_estimate" in str(m).lower() for m in problematic_methods)
+        has_api_failure = any("ecologits_unavailable" in str(m).lower() for m in problematic_methods)
+        has_incomplete = any("incomplete_run" in str(m).lower() for m in problematic_methods)
+        
+        # FIX: Display SDK version for transparency
+        project_versions = df_proj['SDK_VERSION'].dropna().unique()
+        versions_str = ", ".join(project_versions) if len(project_versions) > 0 else "v1.0.0"
+        st.caption(f"**SDK Version Detected:** `{versions_str}`")
+        
+        if has_tdp_fallback or has_api_failure or has_incomplete:
+            st.error("⚠️ **Data Quality Warning:** Some telemetry data in this project may not be 100% accurate.")
+            warning_msgs = []
+            if has_tdp_fallback:
+                warning_msgs.append("- **TDP Fallback:** CodeCarbon could not read physical CPU sensors (likely running in a container) and estimated energy based on the whole machine's max TDP. This typically **overestimates** the footprint.")
+            if has_api_failure:
+                warning_msgs.append("- **API Failure:** EcoLogits remote API was unavailable or rejected the model request during execution. The remote AI footprint was recorded as 0.0, **underestimating** the real impact.")
+            if has_incomplete:
+                warning_msgs.append("- **Incomplete Execution:** Some steps crashed or were killed before finishing. The recorded data only represents a partial run.")
+            for msg in warning_msgs:
+                st.markdown(msg)
+        # -----------------------------------
         
         if 'MEASUREMENT_PERIOD' not in df_proj.columns:
             df_proj['MEASUREMENT_PERIOD'] = np.nan
@@ -1343,7 +1378,7 @@ with tab_insights:
             greenest = model_stats.head(3)
             worst = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'], ascending=False).head(3)
             
-            st.markdown("### 🏆 Top Greenest Models (Most Efficient)")
+            st.markdown("### 🏆 Top Resource Efficient Models")
             g_cols = st.columns(len(greenest))
             for idx, row in enumerate(greenest.itertuples()):
                 with g_cols[idx]:
@@ -1360,7 +1395,7 @@ with tab_insights:
                         st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{meters:.1f}** meters driven\n- 🚰 **{glasses:.1f}** glasses of water")
                     
             st.write("")
-            st.markdown("### 🚨 Most Intensive Models (Heavy Footprint)")
+            st.markdown("### 🚨 Most Resource Intensive Models (Heavy Footprint)")
             w_cols = st.columns(len(worst))
             for idx, row in enumerate(worst.itertuples()):
                 with w_cols[idx]:
