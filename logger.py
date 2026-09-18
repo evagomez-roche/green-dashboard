@@ -245,12 +245,15 @@ class GreenLogger:
                 UPDATE CO_SOFTWARE_CARBON_INTENSITY 
                 SET EFFECTIVE_DATE = ?, EMBODIED_EMISSIONS_GCO2E = ?, ENERGY_CONSUMED_KWH = ?, 
                     EXECUTION_DATE = ?, PROCESS_DESC = ?, REGION = ?, SCI_SCORE_GCO2E_TX = ?, 
-                    TOTAL_CARBON_FOOTPRINT_GCO2E = ?, MEASUREMENT_PERIOD = ?, MEASUREMENT_METHOD = ?, SDK_VERSION = ?
+                    TOTAL_CARBON_FOOTPRINT_GCO2E = ?, MEASUREMENT_PERIOD = ?, MEASUREMENT_METHOD = ?, SDK_VERSION = ?,
+                    PROMPT_TOKENS = ?, COMPLETION_TOKENS = ?, PROVIDER = ?, AI_MODEL_NAME = ?
                 WHERE ID = ?
             """, (
                 payload["EFFECTIVE_DATE"], payload["EMBODIED_EMISSIONS_GCO2E"], payload["ENERGY_CONSUMED_KWH"],
                 payload["EXECUTION_DATE"], payload["PROCESS_DESC"], payload["REGION"], payload["SCI_SCORE_GCO2E_TX"],
                 payload["TOTAL_CARBON_FOOTPRINT_GCO2E"], payload["MEASUREMENT_PERIOD"], payload["MEASUREMENT_METHOD"], payload["SDK_VERSION"],
+                payload.get("PROMPT_TOKENS", 0), payload.get("COMPLETION_TOKENS", 0), 
+                payload.get("PROVIDER", "Unknown"), payload.get("AI_MODEL_NAME", None),
                 self.row_id
             ))
             conn.commit()
