@@ -1,4 +1,2 @@
-pandas
-plotly
-streamlit
-numpy
+codecarbon>=2.3.1
+requests>=2.28.0
