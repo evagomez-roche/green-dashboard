@@ -183,6 +183,7 @@ class GreenLogger:
         # Resolve Region (Extract from tracker if auto-detected)
         detected_region = self.country_iso_code if self.country_iso_code else getattr(self.tracker._measure_power_secs, 'country_iso_code', 'Unknown')
 
+        # SE AÑADEN LAS VARIABLES LATE-BINDING AL PAYLOAD
         payload = {
             "EFFECTIVE_DATE": current_time,
             "EMBODIED_EMISSIONS_GCO2E": float(M_allocated),
@@ -194,7 +195,11 @@ class GreenLogger:
             "TOTAL_CARBON_FOOTPRINT_GCO2E": float(total_carbon),
             "MEASUREMENT_PERIOD": final_period,
             "MEASUREMENT_METHOD": method_str,
-            "SDK_VERSION": SDK_VERSION
+            "SDK_VERSION": SDK_VERSION,
+            "PROMPT_TOKENS": self.prompt_tokens if hasattr(self, 'prompt_tokens') else 0,
+            "COMPLETION_TOKENS": self.completion_tokens if hasattr(self, 'completion_tokens') else 0,
+            "PROVIDER": self.provider if hasattr(self, 'provider') else "Unknown",
+            "AI_MODEL_NAME": self.ai_model_name if hasattr(self, 'ai_model_name') else None
         }
 
         # Update the row instead of creating a new one
