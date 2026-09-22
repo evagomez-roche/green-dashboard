@@ -1,2 +1,6 @@
 codecarbon>=2.3.1
 requests>=2.28.0
+pandas
+plotly
+streamlit
+numpy
