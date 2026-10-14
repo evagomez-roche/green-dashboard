@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import numpy as np
 import re
+import time
 
 # =====================================================================
 # PAGE CONFIGURATION & KNOWN METADATA
@@ -83,9 +84,6 @@ st.markdown('''
     </style>
 ''', unsafe_allow_html=True)
 
-st.title("🌱 SCITracker: Software Carbon Intensity Dashboard")
-st.caption("Green Software Foundation Telemetry & Real-Time Analytics")
-
 # =====================================================================
 # FORMATTING & NORMALIZATION HELPERS
 # =====================================================================
@@ -161,7 +159,6 @@ def parse_period_to_hours(period_str):
 def format_time_duration(seconds):
     if seconds <= 0: return "0 seconds"
     if seconds < 60: return f"{int(seconds)} seconds"
-    
     minutes = seconds // 60
     sec_rem = seconds % 60
     if minutes < 60: 
@@ -204,9 +201,17 @@ def get_equivalence_1000_prompts(wh_tx, ml_tx):
     tot_co2 = (tot_wh / 1000) * 300 # Standard 300g/kWh for cloud
     
     phones = int(tot_wh / 15) if tot_wh >= 15 else (tot_wh / 15)
-    meters_driven = (tot_co2 / 120) * 1000
-    glasses = tot_ml / 250
-    return phones, meters_driven, glasses, tot_co2, tot_ml
+    km_driven = (tot_co2 / 120) 
+    if tot_ml < 250:
+        water_val = tot_ml / 15.0 # 15 ml per tablespoon
+        water_unit = "tablespoons of water"
+        water_icon = "🥄"
+    else:
+        water_val = tot_ml / 250.0 # 250 ml per glass
+        water_unit = "glasses of water"
+        water_icon = "🚰"
+        
+    return phones, km_driven, water_val, water_unit, water_icon, tot_co2, tot_ml
 
 # =====================================================================
 # DATA LOADING & COST CALCULATION
@@ -263,13 +268,11 @@ def process_dataframe(df):
     else:
         df['MEASUREMENT_METHOD'] = df['MEASUREMENT_METHOD'].fillna('legacy_v1_data')
         
-    # INJECT SDK_VERSION dynamically for backwards compatibility in UI
     if 'SDK_VERSION' not in df.columns:
         df['SDK_VERSION'] = 'v1.0.0'
     else:
         df['SDK_VERSION'] = df['SDK_VERSION'].fillna('v1.0.0')
 
-    # INFER PROVIDER LOGIC BASED ON AI MODEL NAME
     def infer_provider(row):
         provider = row.get('PROVIDER', 'Unknown')
         if pd.notna(provider) and str(provider).strip() != 'Unknown':
@@ -294,17 +297,14 @@ def process_dataframe(df):
     df['PROVIDER'] = df.apply(infer_provider, axis=1)
         
     df['Functional Unit Details'] = df['FUNCTIONAL_UNIT_TX'].astype(str) + " (" + df['FUNCTIONAL_UNIT_NAME'] + ")"
-    df['Total_Tokens'] = df['PROMPT_TOKENS'] + df['COMPLETION_TOKENS']
 
     df['Join_Key'] = df['AI_MODEL_NAME'].apply(normalize_model_name)
 
     df_costs = load_cost_data()
     if not df_costs.empty:
         df = df.merge(df_costs, on='Join_Key', how='left')
-        df['Estimated_Cost_$'] = df['Total_Tokens'] * df['Cost_Per_Token']
-        df['Estimated_Cost_$'] = df['Estimated_Cost_$'].fillna(0.0)
     else:
-        df['Estimated_Cost_$'] = 0.0
+        df['Cost_Per_Token'] = 0.0
         
     df = df.rename(columns={
         'SCI_TRACKER_ID': 'SCI Tracker ID',
@@ -318,6 +318,19 @@ def process_dataframe(df):
     })
     
     df['Operational_Emissions_gCO2e'] = df['Total Carbon Footprint (g CO2e)']
+
+    # Manejo seguro de nuevas columnas v2.0 (CLEER) para no romper datos antiguos
+    for col in ['CACHED_TOKENS', 'BASELINE_SCI_GCO2E', 'CLEER_SCI_GCO2E', 'OPTIMIZATION_YIELD_PCT']:
+        if col not in df.columns:
+            df[col] = 0.0 if col != 'CACHED_TOKENS' else 0
+        else:
+            df[col] = df[col].fillna(0)
+
+    # El Total de Tokens ahora debe incluir la caché para reflejar el coste del payload real
+    df['Total_Tokens'] = df['PROMPT_TOKENS'] + df['COMPLETION_TOKENS'] + df['CACHED_TOKENS']
+    df['Estimated_Cost_$'] = df['Total_Tokens'] * df['Cost_Per_Token']
+    df['Estimated_Cost_$'] = df['Estimated_Cost_$'].fillna(0.0)
+
     return df
 
 def apply_phase_filter(df, view_phases):
@@ -332,602 +345,141 @@ def apply_phase_filter(df, view_phases):
     else:
         return pd.DataFrame(columns=df.columns)
 
-df, source = load_data()
-
 # =====================================================================
-# SIDEBAR CONTROLS & FILTERS
+# MAIN APP RENDERING LOGIC
 # =====================================================================
-st.sidebar.header("🔄 Real-Time Controls")
+def render_app():
+    st.title("🌱 SCITracker: Software Carbon Intensity Dashboard")
+    st.caption("Green Software Foundation Telemetry & Real-Time Analytics")
 
-if source == "LOCAL_SQLITE":
-    st.sidebar.info("🟡 Source: Local SQLite Database")
+    df, source = load_data()
 
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
+    # =====================================================================
+    # SIDEBAR CONTROLS & FILTERS
+    # =====================================================================
+    st.sidebar.header("🔄 Real-Time Controls")
 
-if source == "EMPTY" or (df is not None and df.empty):
-    st.info("ℹ️ Telemetry database is currently empty. Run your test script to populate 'green_telemetry.db'.")
-    st.stop()
-elif df is None:
-    st.error(f"❌ Database connection error: {source}")
-    st.stop()
+    if source == "LOCAL_SQLITE":
+        st.sidebar.info("🟡 Source: Local SQLite Database")
 
-st.sidebar.divider()
-st.sidebar.header("Filter Telemetry")
-selected_projects = st.sidebar.multiselect(
-    "Select Project / Software Unit", 
-    options=df['Project'].unique(), 
-    default=df['Project'].unique()
-)
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
 
-filtered_df = df[df['Project'].isin(selected_projects)].copy()
+    if source == "EMPTY" or (df is not None and df.empty):
+        st.info("ℹ️ Telemetry database is currently empty. Run your test script to populate 'green_telemetry.db'.")
+        st.stop()
+    elif df is None:
+        st.error(f"❌ Database connection error: {source}")
+        st.stop()
 
-if filtered_df.empty:
-    st.warning("No data available for the selected project filters.")
-    st.stop()
-
-filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZATION)', regex=False)
-
-# =====================================================================
-# TABS SETUP
-# =====================================================================
-tab_global, tab_standard, tab_ai, tab_water, tab_drilldown, tab_insights = st.tabs([
-    "🌍 Global Overview", 
-    "💻 SCI (Standard Code)", 
-    "🧠 SCI for AI (Models & Costs)", 
-    "💧 Water Footprint",
-    "🔍 Project Drill-down",
-    "💡 AI Models Benchmark"
-])
-
-# =====================================================================
-# TAB 1: GLOBAL OVERVIEW
-# =====================================================================
-with tab_global:
-    st.subheader("🌍 Global Impact Overview (Run Rate Projection)")
-    st.markdown("Compare the true environmental and financial impact of all projects scaled to a unified timeframe.")
-    
-    target_scale_global = st.radio(
-        "⏱️ Project all metrics to:", 
-        options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
-        horizontal=True,
-        key="global_scale"
+    st.sidebar.divider()
+    st.sidebar.header("Filter Telemetry")
+    selected_projects = st.sidebar.multiselect(
+        "Select Project / Software Unit", 
+        options=df['Project'].unique(), 
+        default=df['Project'].unique()
     )
-    scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
-    df_global_scaled = filtered_df.copy()
-    
-    if 'MEASUREMENT_PERIOD' not in df_global_scaled.columns:
-        df_global_scaled['MEASUREMENT_PERIOD'] = np.nan
-        
-    df_global_scaled['MEASUREMENT_PERIOD'] = df_global_scaled.apply(
-        lambda row: KNOWN_PERIODS.get(row['Project'], "Unknown") if pd.isna(row['MEASUREMENT_PERIOD']) else row['MEASUREMENT_PERIOD'], 
-        axis=1
-    )
-    
-    if target_scale_global != "Raw Data (No Scaling)":
-        target_hours = scale_map[target_scale_global]
-        scale_cols = ['Total Carbon Footprint (g CO2e)', 'Energy Consumed - E (kWh)', 'Estimated_Cost_$', 'Embodied Emissions - M (g CO2e)', 'Operational_Emissions_gCO2e', 'Functional Unit - R (Transactions)']
-        
-        def scale_global_row(row):
-            base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
-            if base_hours and base_hours > 0:
-                mult = target_hours / base_hours
-                for col in scale_cols:
-                    if col in row.index and pd.notna(row[col]):
-                        row[col] = row[col] * mult
-            return row
-            
-        df_global_scaled = df_global_scaled.apply(scale_global_row, axis=1)
+    filtered_df = df[df['Project'].isin(selected_projects)].copy()
 
-    st.divider()
+    if filtered_df.empty:
+        st.warning("No data available for the selected project filters.")
+        st.stop()
 
-    st.subheader("📋 Telemetry Registry (`CO_SOFTWARE_CARBON_INTENSITY`)")
-    
-    base_cols = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'Component / Step' if 'Component / Step' in df_global_scaled.columns else 'PROCESS_DESC']
-    display_cols = [c for c in base_cols if c in df_global_scaled.columns]
-    
-    other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
-    display_cols.extend([c for c in other_cols if c in df_global_scaled.columns])
-    display_cols.extend([col for col in df_global_scaled.columns if col not in display_cols and col != 'Join_Key' and col != 'MEASUREMENT_METHOD'])
-    
-    df_display_tab1 = format_dataframe_display(df_global_scaled[display_cols].sort_values(by="Date", ascending=False))
-    st.dataframe(df_display_tab1, use_container_width=True)
-    
-    st.divider()
+    filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZATION)', regex=False)
 
-    st.subheader(f"📈 Key Impact Metrics ({target_scale_global})")
-    m1, m2, m3, m4 = st.columns(4)
-    total_carbon = df_global_scaled['Total Carbon Footprint (g CO2e)'].sum()
-    avg_sci = df_global_scaled['SCI Score (g CO2e/tx)'].mean()
-    total_energy = df_global_scaled['Energy Consumed - E (kWh)'].sum()
-    
-    max_su_idx = df_global_scaled['SCI Score (g CO2e/tx)'].idxmax()
-    max_su = df_global_scaled.loc[max_su_idx]['SCI Tracker ID'] if pd.notna(max_su_idx) else "N/A"
-    
-    with m1:
-        st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
-    with m2:
-        st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
-    with m3:
-        st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(total_energy)} kWh</h2></div>', unsafe_allow_html=True)
-    with m4:
-        st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su}</h2></div>', unsafe_allow_html=True)
-
-    st.divider()
-    
-    tab1_phases = st.multiselect(
-        "⚖️ Select Phase (Filters footprint distribution charts below):", 
-        options=["Baseline (Pre)", "Optimized (Post)"],
-        default=["Baseline (Pre)"],
-        key="tab1_phase"
-    )
-    df_tab1 = apply_phase_filter(df_global_scaled, tab1_phases)
-
-    st.subheader(f"📊 Footprint & Workload Distribution ({target_scale_global})")
-    c1, c2 = st.columns(2)
-    with c1:
-        proj_agg = df_tab1.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
-        proj_agg = add_percent_to_labels(proj_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
-        fig_pie = px.pie(proj_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Footprint by Project", hole=0.4)
-        fig_pie.update_traces(textinfo='none')
-        st.plotly_chart(fig_pie, use_container_width=True)
-    with c2:
-        df_tab1['Workload_Type'] = df_tab1['IS_AI'].apply(lambda x: 'AI / LLM Inference' if x == 1 else 'Standard Code')
-        ai_agg = df_tab1.groupby('Workload_Type')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
-        fig_ai = px.bar(ai_agg, x='Workload_Type', y='Total Carbon Footprint (g CO2e)', title="Footprint by Workload Type", color='Workload_Type', color_discrete_map={'Standard Code': '#2ecc71', 'AI / LLM Inference': '#9b59b6'})
-        st.plotly_chart(fig_ai, use_container_width=True)
-
-    st.divider()
-    
-    st.subheader("⚡ Average SCI Breakdown: Operational (E × I) vs Embodied Carbon (M)")
-    st.info("SCI is an intensity ratio (gCO₂e per transaction). It remains constant regardless of the selected time projection.")
-    
-    lifespan_years = st.slider("Hardware Lifespan Simulator (Years)", min_value=1, max_value=10, value=4, step=1, key="global_lifespan")
-    df_grouped = df_tab1.groupby('Project').agg({
-        'Embodied Emissions - M (g CO2e)': 'sum', 
-        'Operational_Emissions_gCO2e': 'sum', 
-        'Functional Unit - R (Transactions)': 'sum'
-    }).reset_index()
-    
-    df_grouped['M_Adjusted'] = df_grouped['Embodied Emissions - M (g CO2e)'] / lifespan_years
-    df_grouped['Embodied_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['M_Adjusted'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
-    df_grouped['Operational_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['Operational_Emissions_gCO2e'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
-
-    fig_stack = go.Figure(data=[
-        go.Bar(name='Operational Emissions (E × I / R)', x=df_grouped['Project'], y=df_grouped['Operational_gCO2e_tx'], marker_color='#2ecc71'),
-        go.Bar(name='Embodied Emissions (M / R)', x=df_grouped['Project'], y=df_grouped['Embodied_gCO2e_tx'], marker_color='#e74c3c')
+    # =====================================================================
+    # TABS SETUP
+    # =====================================================================
+    tab_drilldown, tab_global, tab_water, tab_insights = st.tabs([
+        "🔍 Project Drill-down",
+        "🌍 Global Overview", 
+        "💧 Water Footprint",
+        "💡 AI Models Benchmark"
     ])
-    fig_stack.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
-    
-    global_avg_sci = df_tab1['SCI Score (g CO2e/tx)'].mean()
-    if pd.notna(global_avg_sci):
-        fig_stack.add_hline(y=global_avg_sci, line_dash="dash", line_color="gray", 
-                            annotation_text=f"Global Avg SCI: {global_avg_sci:.2f}", 
-                            annotation_position="top left")
-    
-    st.plotly_chart(fig_stack, use_container_width=True)
 
-# =====================================================================
-# TAB 2: SCI (STANDARD CODE)
-# =====================================================================
-with tab_standard:
-    df_std_base = filtered_df[filtered_df['IS_AI'] == 0].copy()
-    if df_std_base.empty:
-        st.info("No standard code telemetry found in the selected projects.")
-    else:
-        st.subheader("📋 Standard Projects Registry")
-        display_cols_std = [c for c in display_cols if c in df_std_base.columns and c != 'Join_Key']
+    # =====================================================================
+    # TAB 1: PROJECT DRILL-DOWN
+    # =====================================================================
+    with tab_drilldown:
+        st.subheader("🔍 Deep Dive & Actionable Insights")
+        selected_proj_drill = st.selectbox("Select Project to analyze:", options=filtered_df['Project'].unique(), key="drilldown_select")
         
-        df_display_tab2 = format_dataframe_display(df_std_base[display_cols_std].sort_values(by="Date", ascending=False))
-        st.dataframe(df_display_tab2, use_container_width=True)
-        st.divider()
-        tab2_phases = st.multiselect(
-            "⚖️ Select Phase (Filters KPIs and charts below):", 
-            options=["Baseline (Pre)", "Optimized (Post)"],
-            default=["Baseline (Pre)"],
-            key="tab2_phase"
-        )
-        df_tab2 = apply_phase_filter(df_std_base, tab2_phases)
-
-        st.subheader("📈 Standard Code KPIs")
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_number(df_tab2["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
-        with s2:
-            st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_number(df_tab2["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
-        with s3:
-            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(df_tab2["Energy Consumed - E (kWh)"].sum())} kWh</h2></div>', unsafe_allow_html=True)
-        with s4:
-            max_su_idx_std = df_tab2['SCI Score (g CO2e/tx)'].idxmax() if not df_tab2.empty else None
-            max_su_std = df_tab2.loc[max_su_idx_std]['SCI Tracker ID'] if pd.notna(max_su_idx_std) else "N/A"
-            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_std}</h2></div>', unsafe_allow_html=True)
-        
-        st.divider()
-        st.subheader("📊 Standard Projects Overview")
-        c3, c4 = st.columns(2)
-        with c3:
-            std_agg = df_tab2.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
-            std_agg = add_percent_to_labels(std_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
-            fig_pie_std = px.pie(std_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by Standard Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
-            fig_pie_std.update_traces(textinfo='none')
-            st.plotly_chart(fig_pie_std, use_container_width=True)
-        with c4:
-            st.markdown("**(Hardware Lifespan Simulator)**")
-            lifespan_std = st.slider("Lifespan (Years)", min_value=1, max_value=10, value=4, step=1, key="std_lifespan")
-            df_std_grp = df_tab2.groupby('Project').agg({'Embodied Emissions - M (g CO2e)': 'sum', 'Operational_Emissions_gCO2e': 'sum', 'Functional Unit - R (Transactions)': 'sum'}).reset_index()
-            df_std_grp['M_Adjusted'] = df_std_grp['Embodied Emissions - M (g CO2e)'] / lifespan_std
-            df_std_grp['Embodied_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['M_Adjusted'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
-            df_std_grp['Operational_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['Operational_Emissions_gCO2e'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
+        df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
+        if not df_proj.empty:
+            is_ai_proj = df_proj['IS_AI'].any()
             
-            fig_stack_std = go.Figure(data=[
-                go.Bar(name='Operational', x=df_std_grp['Project'], y=df_std_grp['Operational_gCO2e_tx'], marker_color='#2ecc71'),
-                go.Bar(name='Embodied', x=df_std_grp['Project'], y=df_std_grp['Embodied_gCO2e_tx'], marker_color='#e74c3c')
-            ])
-            fig_stack_std.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
-            std_avg_sci = df_tab2['SCI Score (g CO2e/tx)'].mean()
-            if pd.notna(std_avg_sci):
-                fig_stack_std.add_hline(y=std_avg_sci, line_dash="dash", line_color="gray", 
-                                        annotation_text=f"Std Avg SCI: {std_avg_sci:.2f}", 
-                                        annotation_position="top left")
-                                        
-            st.plotly_chart(fig_stack_std, use_container_width=True)
-
-# =====================================================================
-# TAB 3: SCI FOR AI (MODELS & COSTS)
-# =====================================================================
-with tab_ai:
-    df_ai_base = filtered_df[filtered_df['IS_AI'] == 1].copy()
-    if df_ai_base.empty:
-        st.info("No AI telemetry found in the selected projects.")
-    else:
-        st.subheader("📋 AI Projects Registry")
-        
-        base_cols_ai = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'AI_MODEL_NAME']
-        display_cols_ai = [c for c in base_cols_ai if c in df_ai_base.columns]
-        other_cols_ai = ['Total_Tokens', 'Total Carbon Footprint (g CO2e)', 'Estimated_Cost_$']
-        display_cols_ai.extend([c for c in other_cols_ai if c in df_ai_base.columns])
-        
-        display_cols_ai.extend([c for c in df_ai_base.columns if c not in display_cols_ai and c != 'Join_Key' and c != 'MEASUREMENT_METHOD'])
-        
-        formatted_df_ai = df_ai_base.copy()
-        
-        df_display_tab3 = format_dataframe_display(formatted_df_ai[display_cols_ai].sort_values(by="Date", ascending=False))
-        if 'Estimated_Cost_$' in df_display_tab3.columns:
-            df_display_tab3['Estimated_Cost_$'] = df_ai_base['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
-
-        st.dataframe(df_display_tab3, use_container_width=True)
-        st.divider()
-
-        tab3_phases = st.multiselect(
-            "⚖️ Select Phase (Filters KPIs and charts below):", 
-            options=["Baseline (Pre)", "Optimized (Post)"],
-            default=["Baseline (Pre)"],
-            key="tab3_phase"
-        )
-        df_tab3 = apply_phase_filter(df_ai_base, tab3_phases)
-
-        st.subheader("📈 AI Code KPIs")
-        a1, a2, a3, a4 = st.columns(4)
-        with a1:
-            st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_number(df_tab3["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
-        with a2:
-            st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_number(df_tab3["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
-        with a3:
-            st.markdown(f'<div class="metric-card"><h4>Total Tokens</h4><h2>{df_tab3["Total_Tokens"].sum():,.0f}</h2></div>', unsafe_allow_html=True)
-        with a4:
-            max_ai_idx = df_tab3['SCI Score (g CO2e/tx)'].idxmax() if not df_tab3.empty else None
-            max_su_ai = df_tab3.loc[max_ai_idx]['SCI Tracker ID'] if pd.notna(max_ai_idx) else "N/A"
-            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_ai}</h2></div>', unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("📊 AI Analytics & Financial FinOps")
-        
-        ai_agg_proj = df_tab3.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
-        ai_agg_proj = add_percent_to_labels(ai_agg_proj, 'Total Carbon Footprint (g CO2e)', 'Project')
-        fig_pie_ai = px.pie(ai_agg_proj, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by AI Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
-        fig_pie_ai.update_traces(textinfo='none')
-        st.plotly_chart(fig_pie_ai, use_container_width=True)
-        
-        st.write("") 
-        
-        total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():,.4f}"
-        st.markdown(f'<div class="metric-card-ai" style="text-align: center; margin-bottom: 20px;"><h4>Total FinOps Cost Across All AI Projects</h4><h2 style="font-size: 2.5rem !important;">{total_cost_str}</h2></div>', unsafe_allow_html=True)
-        
-        cost_agg_proj = df_tab3.groupby('Project')['Estimated_Cost_$'].sum().reset_index()
-        fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
-        st.plotly_chart(fig_cost_proj, use_container_width=True)
-
-# =====================================================================
-# TAB 4: WATER FOOTPRINT (DIRECT EVAPORATION)
-# =====================================================================
-with tab_water:
-    st.subheader("💧 Water Footprint (Direct Evaporation - Level 1)")
-    st.markdown("""
-    *Calculates direct water consumption in data centers based on Energy (kWh) and verified provider Water Usage Effectiveness (WUE).*
-    """)
-    st.info("**What is Level 1 Water?** It refers to the direct on-site water evaporated by the cooling towers inside the hyperscale data center to keep the servers from overheating. It does not include Level 2 indirect water (e.g., water used by power plants to generate the electricity).")
-    
-    df_water = filtered_df.copy()
-    
-    # 1. Map Provider to WUE
-    df_water['WUE (L/kWh)'] = df_water['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
-    
-    # 2. Mathematical Formula: Water (Liters) = Energy (kWh) * WUE
-    df_water['Water_Consumed_Liters'] = df_water['Energy Consumed - E (kWh)'] * df_water['WUE (L/kWh)']
-    
-    # 3. Water Intensity: (Liters * 1000) / Transactions
-    df_water['Water_Intensity_ml_tx'] = (df_water['Water_Consumed_Liters'] * 1000) / df_water['Functional Unit - R (Transactions)'].replace(0, 1)
-
-    # Top-level Metrics
-    total_water = df_water['Water_Consumed_Liters'].sum()
-    avg_water_intensity = df_water['Water_Intensity_ml_tx'].mean()
-    
-    w1, w2 = st.columns(2)
-    with w1:
-        st.markdown(f'<div class="metric-card-water"><h4>Total Water Evaporated</h4><h2>{format_number(total_water)} Liters</h2></div>', unsafe_allow_html=True)
-    with w2:
-        st.markdown(f'<div class="metric-card-water"><h4>Average Water Intensity</h4><h2>{format_number(avg_water_intensity)} ml/tx</h2></div>', unsafe_allow_html=True)
-    
-    st.divider()
-
-    # --- GLOBAL REAL-WORLD EQUIVALENTS ---
-    st.markdown("### 🚰 Global Real-World Equivalents")
-    if total_water > 0:
-        glasses = int(total_water / 0.25) # 250ml per glass
-        bathtubs = int(total_water / 150) # 150L per standard bathtub
-        pools = total_water / 2500000     # 2.5M L per Olympic pool
-        
-        if total_water >= 2500000:
-            st.info(f"💡 The total water evaporated across these projects is **{format_number(total_water)} liters**. That is equivalent to completely filling **{format_number(pools)} Olympic-sized swimming pools**.")
-        elif total_water >= 150:
-            st.info(f"💡 The total water evaporated is **{format_number(total_water)} liters**. That is equivalent to filling **{format_number(bathtubs)} standard bathtubs** or drinking **{format_number(glasses)} glasses of water**.")
-        else:
-            st.info(f"💡 The total water evaporated is **{format_number(total_water)} liters**. That is equivalent to **{format_number(glasses)} glasses of water**.")
-    else:
-        st.info("💡 No water consumption recorded for the selected filters.")
-
-    st.divider()
-
-    # --- PROJECT DRILL-DOWN (COMPONENT LEVEL) ---
-    st.markdown("### 🔍 Project Water Drill-down")
-    st.caption("Select a specific project to see how water consumption is distributed across its different models or execution steps.")
-    
-    water_proj = st.selectbox("Select Project for Component Analysis:", options=df_water['Project'].unique(), key="water_proj_select")
-    df_w_proj = df_water[df_water['Project'] == water_proj].copy()
-    
-    if not df_w_proj.empty:
-        # --- PROJECT-SPECIFIC REAL-WORLD EQUIVALENT ---
-        proj_total_water = df_w_proj['Water_Consumed_Liters'].sum()
-        if proj_total_water > 0:
-            p_glasses = int(proj_total_water / 0.25)
-            p_bathtubs = int(proj_total_water / 150)
-            p_pools = proj_total_water / 2500000
+            # --- DATA QUALITY WARNING SYSTEM ---
+            problematic_methods = df_proj['MEASUREMENT_METHOD'].dropna().unique()
+            has_tdp_fallback = any("tdp_estimate" in str(m).lower() for m in problematic_methods)
+            has_api_failure = any("ecologits_unavailable" in str(m).lower() for m in problematic_methods)
+            has_incomplete = any("incomplete_run" in str(m).lower() for m in problematic_methods)
             
-            if proj_total_water >= 2500000:
-                st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_pools)} Olympic pools**.")
-            elif proj_total_water >= 150:
-                st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_bathtubs)} bathtubs**.")
-            else:
-                st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_glasses)} glasses**.")
-        else:
-            st.success(f"💡 No water consumption recorded for project **{water_proj}**.")
-
-        # --- GROUP COMPONENT LOGIC ---
-        is_ai_proj_w = df_w_proj['IS_AI'].any()
-        group_col_w = 'AI_MODEL_NAME' if is_ai_proj_w else 'PROCESS_DESC'
-        
-        comp_w_df = df_w_proj.groupby(group_col_w).agg({
-            'Water_Consumed_Liters': 'sum',
-            'Water_Intensity_ml_tx': 'mean'
-        }).reset_index().rename(columns={group_col_w: 'Component / Step'})
-
-        # Implement TOP-10 logic for projects with many steps
-        comp_w_df = comp_w_df.sort_values('Water_Consumed_Liters', ascending=False)
-        num_steps = len(comp_w_df)
-
-        if num_steps > 10:
-            top_10 = comp_w_df.head(10)
-            others_water = comp_w_df.iloc[10:]['Water_Consumed_Liters'].sum()
-            others_int = comp_w_df.iloc[10:]['Water_Intensity_ml_tx'].mean()
-            others_row = pd.DataFrame({
-                'Component / Step': [f'Others ({num_steps - 10} steps)'],
-                'Water_Consumed_Liters': [others_water],
-                'Water_Intensity_ml_tx': [others_int]
-            })
-            comp_w_df_chart = pd.concat([top_10, others_row], ignore_index=True)
-            top_10_pct = (top_10['Water_Consumed_Liters'].sum() / proj_total_water) * 100 if proj_total_water > 0 else 0
-            st.caption(f"**Top-10 Optimization:** Displaying the top 10 consumers, which represent **{top_10_pct:.1f}%** of the total water footprint. The remaining {num_steps - 10} steps are aggregated as 'Others'.")
-        else:
-            comp_w_df_chart = comp_w_df.copy()
-
-        # --- DYNAMIC CHART LAYOUT ---
-        chart_items = len(comp_w_df_chart)
-        dynamic_height = max(450, chart_items * 35)
-
-        if chart_items > 5:
-            # HORIZONTAL LAYOUT (Stacked vertically)
-            fig_w_tot = px.bar(
-                comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=True), 
-                x='Water_Consumed_Liters', y='Component / Step', 
-                title="Total Absolute Water (Liters)", 
-                orientation='h',
-                height=dynamic_height,
-                color_discrete_sequence=['#3498db']
-            )
-            st.plotly_chart(fig_w_tot, use_container_width=True)
+            # FIX: Display SDK version for transparency
+            project_versions = df_proj['SDK_VERSION'].dropna().unique()
+            versions_str = ", ".join(project_versions) if len(project_versions) > 0 else "v1.0.0"
+            st.caption(f"**SDK Version Detected:** `{versions_str}`")
             
-            fig_w_int = px.bar(
-                comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=True), 
-                x='Water_Intensity_ml_tx', y='Component / Step', 
-                title="Water Efficiency (ml per transaction)", 
-                orientation='h',
-                height=dynamic_height,
-                color_discrete_sequence=['#2980b9']
-            )
-            st.plotly_chart(fig_w_int, use_container_width=True)
+            if has_tdp_fallback or has_api_failure or has_incomplete:
+                st.error("⚠️ **Data Quality Warning:** Some telemetry data in this project may not be 100% accurate.")
+                warning_msgs = []
+                if has_tdp_fallback:
+                    warning_msgs.append("- **TDP Fallback:** CodeCarbon could not read physical CPU sensors (likely running in a container) and estimated energy based on the whole machine's max TDP. This typically **overestimates** the footprint.")
+                if has_api_failure:
+                    warning_msgs.append("- **API Failure:** EcoLogits remote API was unavailable or rejected the model request during execution. The remote AI footprint was recorded as 0.0, **underestimating** the real impact.")
+                if has_incomplete:
+                    warning_msgs.append("- **Incomplete Execution:** Some steps crashed or were killed before finishing. The recorded data only represents a partial run.")
+                for msg in warning_msgs:
+                    st.markdown(msg)
+            # -----------------------------------
             
-        else:
-            # VERTICAL LAYOUT (Side-by-side)
-            col_w_chart1, col_w_chart2 = st.columns(2)
-            with col_w_chart1:
-                fig_w_tot = px.bar(
-                    comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=False), 
-                    x='Component / Step', y='Water_Consumed_Liters', 
-                    title="Total Absolute Water (Liters)", 
-                    orientation='v',
-                    color_discrete_sequence=['#3498db']
+            if 'MEASUREMENT_PERIOD' not in df_proj.columns:
+                df_proj['MEASUREMENT_PERIOD'] = np.nan
+                
+            df_proj['MEASUREMENT_PERIOD'] = df_proj['MEASUREMENT_PERIOD'].fillna(KNOWN_PERIODS.get(selected_proj_drill, "Unknown"))
+            period_text = df_proj['MEASUREMENT_PERIOD'].iloc[0]
+
+            can_normalize = False
+            valid_periods = [p for p in df_proj['MEASUREMENT_PERIOD'].unique() if "unknown" not in str(p).lower() and pd.notna(p)]
+            has_multiple_steps = len(df_proj) > 1
+            has_mixed_periods = len(valid_periods) > 1
+            
+            if has_multiple_steps and has_mixed_periods:
+                for p in valid_periods:
+                    if parse_period_to_hours(p) is not None:
+                        can_normalize = True
+                        break
+            
+            if can_normalize and "unknown" not in period_text.lower():
+                df_proj_raw = df_proj.copy() 
+                
+                st.write("")
+                st.markdown("### ⏱️ Time Normalization Engine")
+                st.info("Different components in this project were measured over different timeframes. Select a target timeframe to mathematically project and align all absolute metrics (Total Carbon, Energy, Cost). **SCI Scores remain unaffected.**")
+                
+                target_scale = st.radio(
+                    "Project metrics to:", 
+                    options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
+                    horizontal=True
                 )
-                st.plotly_chart(fig_w_tot, use_container_width=True)
                 
-            with col_w_chart2:
-                fig_w_int = px.bar(
-                    comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=False), 
-                    x='Component / Step', y='Water_Intensity_ml_tx', 
-                    title="Water Efficiency (ml per transaction)", 
-                    orientation='v',
-                    color_discrete_sequence=['#2980b9']
-                )
-                st.plotly_chart(fig_w_int, use_container_width=True)
-
-        # --- AUTOMATED INSIGHTS GENERATOR (APPLES-TO-APPLES) ---
-        st.write("")
-        st.markdown("#### 💧 Automated Water Efficiency Insights")
-        if not comp_w_df.empty and len(comp_w_df) > 1:
-            # Emphasize that intensity (ml/tx) is the true efficiency metric
-            best_idx = comp_w_df['Water_Intensity_ml_tx'].idxmin()
-            worst_idx = comp_w_df['Water_Intensity_ml_tx'].idxmax()
-            
-            if pd.notna(best_idx) and pd.notna(worst_idx):
-                best_row = comp_w_df.loc[best_idx]
-                worst_row = comp_w_df.loc[worst_idx]
+                scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
                 
-                best_ml = best_row['Water_Intensity_ml_tx']
-                worst_ml = worst_row['Water_Intensity_ml_tx']
-                
-                multiplier = (worst_ml / best_ml) if best_ml > 0 else 0
-                mult_str = f"**{multiplier:.1f}x more**" if multiplier > 0 else "significantly more"
-                
-                st.info(f"💡 **Apples-to-Apples Comparison:** To truly understand efficiency, we must look at the cost per transaction. "
-                        f"**'{best_row['Component / Step']}'** is your greenest and most efficient component here, evaporating only **{format_number(best_ml)} ml** per prompt. "
-                        f"Conversely, **'{worst_row['Component / Step']}'** is the most water-intensive, consuming **{format_number(worst_ml)} ml** per prompt "
-                        f"({mult_str} than the most efficient one).\n\n"
-                        f"*Note: A high 'Total Absolute Water' bar just means a component is called frequently, but intensity (ml/tx) reveals its architectural efficiency.*")
-
-    st.divider()
-    
-    # --- AI VS STANDARD CONTEXT ---
-    st.subheader("⚖️ AI vs Standard Software: Water Intensity")
-    with st.expander("Why might AI show lower intensity (ml/tx) despite consuming more total water?"):
-        st.markdown("""
-        1. **Cloud Efficiency (WUE):** AI models typically run on hyperscale cloud providers (AWS, GCP) with highly optimized liquid cooling (WUE ~0.20 L/kWh). Standard code often runs on legacy or on-premise servers with less efficient cooling (WUE ~1.80 L/kWh).
-        2. **Transaction Volume (The Denominator):** AI pipelines often process millions of tokens (transactions), mathematically diluting the water cost per single transaction, whereas a standard script might execute once but take minutes to run.
-        """)
-    
-    df_water['Workload_Type'] = df_water['IS_AI'].apply(lambda x: "AI Project" if x == 1 else "Standard Software")
-    comp_water_df = df_water.groupby('Workload_Type')['Water_Intensity_ml_tx'].mean().reset_index()
-    
-    fig_water = px.bar(
-        comp_water_df, 
-        x='Workload_Type', 
-        y='Water_Intensity_ml_tx',
-        color='Workload_Type',
-        title="Average Water Consumption per Transaction (ml/tx)",
-        labels={'Water_Intensity_ml_tx': 'Water Intensity (ml/tx)', 'Workload_Type': 'Category'},
-        color_discrete_map={'Standard Software': '#2ecc71', 'AI Project': '#8e44ad'},
-        text_auto='.2f'
-    )
-    st.plotly_chart(fig_water, use_container_width=True)
-
-    # --- RAW DATA ---
-    st.subheader("🗂️ Raw Water Telemetry")
-    water_display_cols = ['Project', 'PROCESS_DESC', 'AI_MODEL_NAME', 'PROVIDER', 'WUE (L/kWh)', 'Energy Consumed - E (kWh)', 'Water_Consumed_Liters', 'Water_Intensity_ml_tx']
-    valid_w_cols = [c for c in water_display_cols if c in df_water.columns]
-    st.dataframe(format_dataframe_display(df_water[valid_w_cols]), use_container_width=True)
-
-
-# =====================================================================
-# TAB 5: PROJECT DRILL-DOWN
-# =====================================================================
-with tab_drilldown:
-    st.subheader("🔍 Deep Dive & Actionable Insights")
-    selected_proj_drill = st.selectbox("Select Project to analyze:", options=filtered_df['Project'].unique(), key="drilldown_select")
-    
-    df_proj = filtered_df[filtered_df['Project'] == selected_proj_drill].copy()
-    if not df_proj.empty:
-        is_ai_proj = df_proj['IS_AI'].any()
-        
-        # --- DATA QUALITY WARNING SYSTEM ---
-        problematic_methods = df_proj['MEASUREMENT_METHOD'].dropna().unique()
-        has_tdp_fallback = any("tdp_estimate" in str(m).lower() for m in problematic_methods)
-        has_api_failure = any("ecologits_unavailable" in str(m).lower() for m in problematic_methods)
-        has_incomplete = any("incomplete_run" in str(m).lower() for m in problematic_methods)
-        
-        # FIX: Display SDK version for transparency
-        project_versions = df_proj['SDK_VERSION'].dropna().unique()
-        versions_str = ", ".join(project_versions) if len(project_versions) > 0 else "v1.0.0"
-        st.caption(f"**SDK Version Detected:** `{versions_str}`")
-        
-        if has_tdp_fallback or has_api_failure or has_incomplete:
-            st.error("⚠️ **Data Quality Warning:** Some telemetry data in this project may not be 100% accurate.")
-            warning_msgs = []
-            if has_tdp_fallback:
-                warning_msgs.append("- **TDP Fallback:** CodeCarbon could not read physical CPU sensors (likely running in a container) and estimated energy based on the whole machine's max TDP. This typically **overestimates** the footprint.")
-            if has_api_failure:
-                warning_msgs.append("- **API Failure:** EcoLogits remote API was unavailable or rejected the model request during execution. The remote AI footprint was recorded as 0.0, **underestimating** the real impact.")
-            if has_incomplete:
-                warning_msgs.append("- **Incomplete Execution:** Some steps crashed or were killed before finishing. The recorded data only represents a partial run.")
-            for msg in warning_msgs:
-                st.markdown(msg)
-        # -----------------------------------
-        
-        if 'MEASUREMENT_PERIOD' not in df_proj.columns:
-            df_proj['MEASUREMENT_PERIOD'] = np.nan
-            
-        df_proj['MEASUREMENT_PERIOD'] = df_proj['MEASUREMENT_PERIOD'].fillna(KNOWN_PERIODS.get(selected_proj_drill, "Unknown"))
-        period_text = df_proj['MEASUREMENT_PERIOD'].iloc[0]
-
-        can_normalize = False
-        valid_periods = [p for p in df_proj['MEASUREMENT_PERIOD'].unique() if "unknown" not in str(p).lower() and pd.notna(p)]
-        has_multiple_steps = len(df_proj) > 1
-        has_mixed_periods = len(valid_periods) > 1
-        
-        if has_multiple_steps and has_mixed_periods:
-            for p in valid_periods:
-                if parse_period_to_hours(p) is not None:
-                    can_normalize = True
-                    break
-        
-        if can_normalize and "unknown" not in period_text.lower():
-            df_proj_raw = df_proj.copy() 
-            
-            st.write("")
-            st.markdown("### ⏱️ Time Normalization Engine")
-            st.info("Different components in this project were measured over different timeframes. Select a target timeframe to mathematically project and align all absolute metrics (Total Carbon, Energy, Cost). **SCI Scores remain unaffected.**")
-            
-            target_scale = st.radio(
-                "Project metrics to:", 
-                options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
-                horizontal=True
-            )
-            
-            scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
-            
-            if target_scale != "Raw Data (No Scaling)":
-                target_hours = scale_map[target_scale]
-                for idx, row in df_proj.iterrows():
-                    base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
-                    if base_hours and base_hours > 0:
-                        multiplier = target_hours / base_hours
-                        df_proj.at[idx, 'Total Carbon Footprint (g CO2e)'] *= multiplier
-                        df_proj.at[idx, 'Energy Consumed - E (kWh)'] *= multiplier
-                        if 'Estimated_Cost_$' in df_proj.columns:
-                            df_proj.at[idx, 'Estimated_Cost_$'] *= multiplier
-                            
-                        suffix = f" [Projected to {target_scale.split(' ')[0]}]"
-                        df_proj.at[idx, 'PROCESS_DESC'] = f"{row['PROCESS_DESC']}{suffix}"
-                        if pd.notna(row['AI_MODEL_NAME']):
-                            df_proj.at[idx, 'AI_MODEL_NAME'] = f"{row['AI_MODEL_NAME']}{suffix}"
+                if target_scale != "Raw Data (No Scaling)":
+                    target_hours = scale_map[target_scale]
+                    for idx, row in df_proj.iterrows():
+                        base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
+                        if base_hours and base_hours > 0:
+                            multiplier = target_hours / base_hours
+                            df_proj.at[idx, 'Total Carbon Footprint (g CO2e)'] *= multiplier
+                            df_proj.at[idx, 'Energy Consumed - E (kWh)'] *= multiplier
+                            if 'Estimated_Cost_$' in df_proj.columns:
+                                df_proj.at[idx, 'Estimated_Cost_$'] *= multiplier
+                                
+                            suffix = f" [Projected to {target_scale.split(' ')[0]}]"
+                            df_proj.at[idx, 'PROCESS_DESC'] = f"{row['PROCESS_DESC']}{suffix}"
+                            if pd.notna(row['AI_MODEL_NAME']):
+                                df_proj.at[idx, 'AI_MODEL_NAME'] = f"{row['AI_MODEL_NAME']}{suffix}"
 
             with st.expander("📊 View Component Comparison Chart", expanded=False):
                 proj_metric = st.selectbox(
@@ -961,485 +513,998 @@ with tab_drilldown:
                 
                 fig_comp = px.bar(
                     compare_df, x=x_ax, y=y_ax, color=group_col_compare,
-                    title=f"{proj_metric.split(' (')[0]} by Component ({target_scale if 'SCI' not in proj_metric else 'Fixed Ratio'})", 
+                    title=f"{proj_metric.split(' (')[0]} by Component", 
                     orientation=comp_orientation, height=comp_height,
                     color_discrete_sequence=color_seq
                 )
                 st.plotly_chart(fig_comp, use_container_width=True)
                 
-        st.divider()
-        st.subheader(f"📈 Key Impact Metrics (KPIs): {selected_proj_drill}")
-        pm1, pm2, pm3, pm4 = st.columns(4)
-        
-        proj_total_carbon = df_proj['Total Carbon Footprint (g CO2e)'].sum()
-        proj_avg_sci = df_proj['SCI Score (g CO2e/tx)'].mean()
-        proj_total_energy = df_proj['Energy Consumed - E (kWh)'].sum()
-        
-        if not df_proj.empty:
-            hotspot_idx = df_proj['Total Carbon Footprint (g CO2e)'].idxmax()
-            proj_hotspot = df_proj.loc[hotspot_idx]['PROCESS_DESC'] if not is_ai_proj else df_proj.loc[hotspot_idx]['AI_MODEL_NAME']
-        else:
-            proj_hotspot = "N/A"
-            
-        with pm1:
-            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
-        with pm2:
-            st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
-        with pm3:
-            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
-        with pm4:
-            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
-        
-        # Integrate Project-Level Water KPIs here
-        st.write("")
-        df_proj_w = df_proj.copy()
-        df_proj_w['WUE (L/kWh)'] = df_proj_w['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
-        df_proj_w['Water_Consumed_Liters'] = df_proj_w['Energy Consumed - E (kWh)'] * df_proj_w['WUE (L/kWh)']
-        proj_total_water = df_proj_w['Water_Consumed_Liters'].sum()
-        df_proj_w['Water_Intensity_ml_tx'] = (df_proj_w['Water_Consumed_Liters'] * 1000) / df_proj_w['Functional Unit - R (Transactions)'].replace(0, 1)
-        proj_avg_water_int = df_proj_w['Water_Intensity_ml_tx'].mean()
-        
-        pw1, pw2 = st.columns(2)
-        with pw1:
-            st.markdown(f'<div class="metric-card-water"><h4>Total Water Evaporated</h4><h2>{format_number(proj_total_water)} Liters</h2></div>', unsafe_allow_html=True)
-        with pw2:
-            st.markdown(f'<div class="metric-card-water"><h4>Avg. Water Intensity</h4><h2>{format_number(proj_avg_water_int)} ml/tx</h2></div>', unsafe_allow_html=True)
-
-        st.write("")
-        st.divider()
-        st.markdown("### 📊 Benchmark & Real-World Context")
-        
-        project_avg_scis = filtered_df.groupby('Project')['SCI Score (g CO2e/tx)'].mean()
-        global_sci_stats = project_avg_scis.describe()
-        global_median_sci = project_avg_scis.median()
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Global SCI (Min)", f"{format_number(global_sci_stats['min'])} g/tx")
-        c2.metric("Global SCI (Median)", f"{format_number(global_median_sci)} g/tx")
-        c3.metric("Global SCI (Average)", f"{format_number(global_sci_stats['mean'])} g/tx")
-        c4.metric("Global SCI (Max)", f"{format_number(global_sci_stats['max'])} g/tx")
-        
-        st.write("")
-        
-        col_bench1, col_bench2 = st.columns(2)
-        project_totals = filtered_df.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum()
-        global_median_carbon = project_totals.median()
-        with col_bench1:
-            st.markdown("**1. Absolute Environmental Impact (Total Carbon)**")
-            if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon):
-                if proj_total_carbon > global_median_carbon:
-                    st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
-                else:
-                    st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
-        
-        with col_bench2:
-            st.markdown("**2. Software Code Efficiency (Average SCI)**")
-            if pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
-                if proj_avg_sci > global_median_sci:
-                    st.warning(f"⚠️ **Opportunity for Improvement:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **higher** than the global median ({format_number(global_median_sci)} g/tx).")
-                else:
-                    st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_number(global_median_sci)} g/tx).")
-
-        st.caption("*Note: A project like a high-traffic AI model might have a large Total Carbon footprint due to high user demand, while maintaining a highly efficient SCI score per request.*")
-        st.write("")
-        st.markdown("#### 🧠 Executive Insight")
-        
-        if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon) and pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
-            is_high_carbon = proj_total_carbon > global_median_carbon
-            is_high_sci = proj_avg_sci > global_median_sci
-            
-            if is_high_carbon and not is_high_sci:
-                st.success(
-                    "**Scale with Efficiency:** While the total footprint reflects a massive processing volume, the SCI score remains below the global average. "
-                    "This indicates the software architecture is successfully handling high demand with strong per-transaction efficiency. "
-                    "The footprint is driven by business growth, not architectural waste."
-                )
-            elif not is_high_carbon and is_high_sci:
-                st.info(
-                    "**Early Optimization Opportunity:** Current absolute emissions are kept low by moderate usage volumes. "
-                    "However, the higher-than-average SCI suggests there is room to refine the code. "
-                    "Addressing this proactively will prevent disproportionate cloud costs and emissions as the project scales."
-                )
-            elif is_high_carbon and is_high_sci:
-                st.warning(
-                    "**High-Impact Optimization Area:** This project operates at a significant scale and currently shows a higher-than-average SCI. "
-                    "This presents an excellent opportunity: even minor architectural or code-level optimizations here will yield massive, "
-                    "highly visible reductions in both global CO₂ emissions and financial operating costs."
-                )
-            else:
-                st.success(
-                    "**Sustainable Baseline:** This project currently operates with both a low absolute footprint and a highly efficient SCI score. "
-                    "It serves as a strong internal benchmark for Green Software best practices."
-                )
-        
-        st.write("")
-        
-        st.markdown("#### 🌍 Real-World Equivalents & Intensity Context")
-        
-        if is_ai_proj:
-            st.info(f"💡 **Intensity Context (AI):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, an average ChatGPT or Gemini text prompt emits between **2.0 and 3.0 gCO₂e**.")
-        else:
-            st.info(f"💡 **Intensity Context (Standard):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, a standard Google web search emits roughly **0.2 gCO₂e**.")
-
-        if proj_total_energy > 0 or proj_total_carbon > 0:
-            if is_ai_proj:
-                total_wh = proj_total_energy * 1000
-                gemini_queries_eq = total_wh / 0.24 if total_wh > 0 else 0
-                
-                microwave_seconds = gemini_queries_eq * 1
-                fridge_seconds = gemini_queries_eq * 6
-                
-                microwave_str = format_time_duration(microwave_seconds)
-                fridge_str = format_time_duration(fridge_seconds)
-                
-                st.info(
-                    f"💡 **Energy Context (AI):** The {format_number(proj_total_energy)} kWh used by this project equals **{format_number(total_wh)} Wh**. "
-                    f"According to recent Google estimates, a standard Gemini text query uses 0.24 Wh. "
-                    f"This project's total energy is equivalent to running a microwave for **{microwave_str}** or a standard fridge for **{fridge_str}**."
-                )
-            else:
-                if proj_total_carbon < 8.0:
-                    st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
-                else:
-                    smartphones = int(proj_total_carbon / 8.0)
-                    km_driven = proj_total_carbon / 192.0
-                    
-                    if km_driven < 1:
-                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
-                    else:
-                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**.")
-                
-            uk_annual_carbon_g = 7000000.0 # 7 tonnes
-            pct_of_uk_citizen = (proj_total_carbon / uk_annual_carbon_g) * 100
-            
-            st.info(
-                f"💡 **Carbon Context:** The average UK citizen emits 7 tonnes of CO₂ annually from energy and industry. "
-                f"This project's total footprint ({format_number(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
-            )
-        else:
-            st.info("💡 **Context:** The recorded energy and carbon totals for this timeframe are currently **0**. Process more data to see real-world equivalents.")
-
-        if selected_proj_drill == "Galileo":
-            st.info(
-                "**Galileo Telemetry Data Notes:**\n\n"
-                "• **Token Aggregation:** The raw dataset provides a single combined 'Tokens' count. Since the exact split between prompt and completion tokens is unavailable, all consumed tokens have been aggregated and logged under `PROMPT_TOKENS`.\n\n"
-                "• **Data Filtering & Integrity:** The initial raw dataset contained over 2,500 entries. To maintain accurate SCI and carbon calculations, rows with an 'Unknown' provider were excluded. A final filter to match supported and recognized AI models finalized the dataset at exactly **186 valid rows**."
-            )
-
-        if selected_proj_drill == "Archimedes Lever":
-            st.warning(
-                "**Proxy Model Estimation (Archimedes Lever):**\n\n"
-                "The baseline telemetry for this project was originally recorded using Anthropic's 'Opus 5'. "
-                "Since this specific model version is not yet supported by standard carbon tracking APIs, "
-                "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model.\n\n"
-                "**Why Claude 3 Opus?**\n"
-                "We selected this model because it belongs to the same flagship 'Opus' architectural tier. "
-                "It shares the closest parameter scale, computational density, and hardware utilization profile. "
-                "Consequently, its energy consumption per token (Wh/token) provides the most mathematically accurate baseline available to estimate the carbon emissions of a next-generation Opus model."
-            )
-        
-        df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
-        df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
-        
-        group_col_table = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
-        breakdown_table = df_proj.groupby(group_col_table).agg({
-            'SCI Score (g CO2e/tx)': 'mean',
-            'Energy Consumed - E (kWh)': 'sum', 
-            'Total Carbon Footprint (g CO2e)': 'sum', 
-            'Estimated_Cost_$': 'sum',
-            'MEASUREMENT_PERIOD': 'first'
-        }).reset_index()
-        
-        breakdown_table = breakdown_table.rename(columns={
-            group_col_table: 'Component / Step', 
-            'SCI Score (g CO2e/tx)': 'Average SCI Score (g CO2e/tx)',
-            'MEASUREMENT_PERIOD': 'Original Period'
-        })
-        
-        formatted_breakdown = format_dataframe_display(breakdown_table)
-        if 'Estimated_Cost_$' in formatted_breakdown.columns:
-            formatted_breakdown['Estimated_Cost_$'] = breakdown_table['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
-            
-        st.dataframe(formatted_breakdown, use_container_width=True)
-        
-        if df_proj['Is_Post'].any():
-            chart_view_phase = st.selectbox("Select Phase to visualize in Breakdown:", options=["Baseline", "Post-Optimization"])
-            chart_df = df_proj[df_proj['Status'] == chart_view_phase].copy()
-        else:
-            chart_df = df_proj.copy()
-            
-        group_col_chart = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
-        
-        breakdown_chart = chart_df.groupby(group_col_chart).agg({
-            'Total Carbon Footprint (g CO2e)': 'sum',
-            'Estimated_Cost_$': 'sum',
-            'SCI Score (g CO2e/tx)': 'mean'
-        }).reset_index().rename(columns={group_col_chart: 'Component / Step'})
-
-        num_items = len(breakdown_chart)
-        is_horizontal = num_items >= 8
-        orientation_flag = 'h' if is_horizontal else 'v'
-        
-        breakdown_chart = breakdown_chart.sort_values(by='Total Carbon Footprint (g CO2e)', ascending=is_horizontal)
-        dynamic_chart_height = max(450, num_items * 25) if is_horizontal else 450
-        
-        x_carbon = 'Total Carbon Footprint (g CO2e)' if is_horizontal else 'Component / Step'
-        y_carbon = 'Component / Step' if is_horizontal else 'Total Carbon Footprint (g CO2e)'
-        
-        x_cost = 'Estimated_Cost_$' if is_horizontal else 'Component / Step'
-        y_cost = 'Component / Step' if is_horizontal else 'Estimated_Cost_$'
-
-        x_sci = 'SCI Score (g CO2e/tx)' if is_horizontal else 'Component / Step'
-        y_sci = 'Component / Step' if is_horizontal else 'SCI Score (g CO2e/tx)'
-
-        st.write("") 
-
-        fig_drill_carbon = px.bar(
-            breakdown_chart, x=x_carbon, y=y_carbon, color='Component / Step',
-            title="Carbon Impact Breakdown (Total gCO₂e)", 
-            orientation=orientation_flag, height=dynamic_chart_height,
-            color_discrete_sequence=DARK_PURPLES
-        )
-        st.plotly_chart(fig_drill_carbon, use_container_width=True)
-        
-        breakdown_chart_sci = breakdown_chart.sort_values(by='SCI Score (g CO2e/tx)', ascending=is_horizontal)
-        fig_drill_sci = px.bar(
-            breakdown_chart_sci, x=x_sci, y=y_sci, color='Component / Step',
-            title="Intensity Impact Breakdown (Average SCI - gCO₂e/tx)", 
-            orientation=orientation_flag, height=dynamic_chart_height,
-            color_discrete_sequence=px.colors.sequential.Greens[::-1]  
-        )
-        st.plotly_chart(fig_drill_sci, use_container_width=True)
-
-        if is_ai_proj:
-            fig_drill_cost = px.bar(
-                breakdown_chart, x=x_cost, y=y_cost, color='Component / Step',
-                title="Cost Impact Breakdown ($)", 
-                orientation=orientation_flag, height=dynamic_chart_height,
-                color_discrete_sequence=DARK_BLUES
-            )
-            st.plotly_chart(fig_drill_cost, use_container_width=True)
-
-        # =====================================================================
-        # PRE VS POST OPTIMIZATION SAVINGS MODULE
-        # =====================================================================
-        if df_proj['Is_Post'].any():
             st.divider()
-            st.subheader("📉 Optimization Trajectory & Savings (Pre vs Post)")
+            st.subheader(f"📈 Key Impact Metrics (KPIs): {selected_proj_drill}")
+            pm1, pm2, pm3, pm4 = st.columns(4)
             
-            df_pre = df_proj[~df_proj['Is_Post']]
-            df_post = df_proj[df_proj['Is_Post']]
+            proj_total_carbon = df_proj['Total Carbon Footprint (g CO2e)'].sum()
+            proj_avg_sci = df_proj['SCI Score (g CO2e/tx)'].mean()
+            proj_total_energy = df_proj['Energy Consumed - E (kWh)'].sum()
             
-            pre_carbon_total = df_pre['Total Carbon Footprint (g CO2e)'].sum()
-            post_carbon_total = df_post['Total Carbon Footprint (g CO2e)'].sum()
-            
-            compare_data = pd.DataFrame({
-                'Phase': ['Baseline', 'Post-Optimization'],
-                'Carbon Footprint (gCO2e)': [pre_carbon_total, post_carbon_total]
-            })
-            if is_ai_proj:
-                pre_cost_total = df_pre['Estimated_Cost_$'].sum()
-                post_cost_total = df_post['Estimated_Cost_$'].sum()
-                compare_data['Financial Cost ($)'] = [pre_cost_total, post_cost_total]
-                
-                g1, g2 = st.columns(2)
-                with g1:
-                    fig_comp_carbon = px.bar(
-                        compare_data, x='Phase', y='Carbon Footprint (gCO2e)', color='Phase',
-                        title='Carbon Reduction Overview', text_auto='.2f',
-                        color_discrete_map={'Baseline': '#e74c3c', 'Post-Optimization': '#2ecc71'}
-                    )
-                    st.plotly_chart(fig_comp_carbon, use_container_width=True)
-                with g2:
-                    fig_comp_cost = px.bar(
-                        compare_data, x='Phase', y='Financial Cost ($)', color='Phase',
-                        title='FinOps Savings Overview', text_auto='.4f',
-                        color_discrete_map={'Baseline': '#7f8c8d', 'Post-Optimization': '#3498db'}
-                    )
-                    st.plotly_chart(fig_comp_cost, use_container_width=True)
+            if not df_proj.empty:
+                hotspot_idx = df_proj['Total Carbon Footprint (g CO2e)'].idxmax()
+                proj_hotspot = df_proj.loc[hotspot_idx]['PROCESS_DESC'] if not is_ai_proj else df_proj.loc[hotspot_idx]['AI_MODEL_NAME']
             else:
-                fig_comp_carbon = px.bar(
-                    compare_data, x='Phase', y='Carbon Footprint (gCO2e)', color='Phase',
-                    title='Carbon Reduction Overview', text_auto='.2f',
-                    color_discrete_map={'Baseline': '#e74c3c', 'Post-Optimization': '#2ecc71'}
-                )
-                st.plotly_chart(fig_comp_carbon, use_container_width=True)
-
-            st.markdown("### 📊 Overall Project Savings")
-            
-            carbon_saved = pre_carbon_total - post_carbon_total
-            carbon_pct = (carbon_saved / pre_carbon_total * 100) if pre_carbon_total > 0 else 0
-            
-            carbon_saved_str = format_number(carbon_saved)
-            carbon_pct_str = format_number(-carbon_pct)
-            
-            if is_ai_proj:
-                cost_saved = pre_cost_total - post_cost_total
-                cost_pct = (cost_saved / pre_cost_total * 100) if pre_cost_total > 0 else 0
-                cost_saved_str = format_number(cost_saved)
-                cost_pct_str = format_number(-cost_pct)
+                proj_hotspot = "N/A"
                 
-                m1, m2 = st.columns(2)
-                m1.metric("Total Carbon Reduction", f"{carbon_saved_str} gCO₂e", f"{carbon_pct_str}%", delta_color="inverse")
-                m2.metric("Total FinOps Savings", f"${cost_saved_str}", f"{cost_pct_str}%", delta_color="inverse")
-            else:
-                st.metric("Total Carbon Reduction", f"{carbon_saved_str} gCO₂e", f"{carbon_pct_str}%", delta_color="inverse")
+            with pm1:
+                st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+            with pm2:
+                st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
+            with pm3:
+                st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
+            with pm4:
+                st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
             
-            if carbon_saved >= 8.0:
-                st.markdown("#### 🌍 Real-World Impact Equivalent")
-                smartphones = int(carbon_saved / 8.0) 
-                
-                if carbon_saved >= 192.0:
-                    km_driven = carbon_saved / 192.0 
-                    st.info(f"💡 The **{format_number(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**!")
-                else:
-                    st.info(f"💡 The **{format_number(carbon_saved)} gCO₂e** saved by optimizing this project is equivalent to the carbon footprint of charging **{smartphones} smartphones**!")   
-            
-            pre_steps = set(df_pre['Clean_Step'].unique())
-            post_steps = set(df_post['Clean_Step'].unique())
-            matching_steps = pre_steps.intersection(post_steps)
-            
-            if matching_steps:
-                st.divider()
-                st.markdown("### 🔍 Granular Step-by-Step Savings")
-                st.caption("Showing exact component matches between baseline and optimized runs.")
-                
-                step_results = {}
-                for step in matching_steps:
-                    pre_c = df_pre[df_pre['Clean_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum()
-                    post_c = df_post[df_post['Clean_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum()
-                    saved = pre_c - post_c
-                    pct = (saved / pre_c * 100) if pre_c > 0 else 0
-                    step_results[step] = {'saved': saved, 'pct': pct, 'pre': pre_c, 'post': post_c}
-                
-                best_step = max(step_results, key=lambda k: step_results[k]['pct']) if step_results else None
-                
-                cols = st.columns(3) 
-                col_idx = 0
-                for step, metrics in step_results.items():
-                    with cols[col_idx % 3]:
-                        with st.container(border=True):
-                            badge = "🏆" if step == best_step and metrics['pct'] > 0 else "🧩"
-                            st.markdown(f"**{badge} `{step}`**")
-                            
-                            if metrics['pct'] < 0:
-                                st.error("Regression Detected")
-                            elif metrics['pct'] > 0:
-                                st.success("Improved Efficiency")
-                            else:
-                                st.info("No Change")
-
-                            if is_ai_proj:
-                                step_pre_cost = df_pre[df_pre['Clean_Step'] == step]['Estimated_Cost_$'].sum()
-                                step_post_cost = df_post[df_post['Clean_Step'] == step]['Estimated_Cost_$'].sum()
-                                step_cost_saved = step_pre_cost - step_post_cost
-                                step_cost_pct = (step_cost_saved / step_pre_cost * 100) if step_pre_cost > 0 else 0
-                                
-                                st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
-                                st.metric("FinOps Savings", f"${format_number(step_cost_saved)}", f"{format_number(-step_cost_pct)}%", delta_color="inverse")
-                            else:
-                                st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
-                    col_idx += 1
-
-# =====================================================================
-# TAB 6: AI MODELS BENCHMARK & INSIGHTS
-# =====================================================================
-with tab_insights:
-    st.subheader("💡 AI Models Benchmark & Insights")
-    st.markdown("Analyze raw environmental performance across all AI models irrespective of the specific project to inform architectural decisions.")
-    
-    df_ai_ins = filtered_df[filtered_df['IS_AI'] == 1].copy()
-    
-    if df_ai_ins.empty:
-        st.info("No AI telemetry found to generate benchmark insights.")
-    else:
-        # Calculate water metrics for all AI rows
-        df_ai_ins['WUE (L/kWh)'] = df_ai_ins['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
-        df_ai_ins['Water_Consumed_Liters'] = df_ai_ins['Energy Consumed - E (kWh)'] * df_ai_ins['WUE (L/kWh)']
-        
-        # Group by the normalized AI model name
-        model_stats = df_ai_ins.groupby('Join_Key').agg({
-            'Energy Consumed - E (kWh)': 'sum',
-            'Water_Consumed_Liters': 'sum',
-            'Functional Unit - R (Transactions)': 'sum',
-            'Estimated_Cost_$': 'sum'
-        }).reset_index()
-        
-        # Calculate strict intensity metrics (Wh/tx and ml/tx)
-        model_stats['Energy_Intensity_Wh_tx'] = (model_stats['Energy Consumed - E (kWh)'] * 1000) / model_stats['Functional Unit - R (Transactions)'].replace(0, 1)
-        model_stats['Water_Intensity_ml_tx'] = (model_stats['Water_Consumed_Liters'] * 1000) / model_stats['Functional Unit - R (Transactions)'].replace(0, 1)
-        
-        # Filter valid interactions
-        model_stats = model_stats[model_stats['Functional Unit - R (Transactions)'] > 0]
-        
-        if not model_stats.empty:
-            model_stats = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'])
-            
-            greenest = model_stats.head(3)
-            worst = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'], ascending=False).head(3)
-            
-            st.markdown("### 🏆 Top Resource Efficient Models")
-            g_cols = st.columns(len(greenest))
-            for idx, row in enumerate(greenest.itertuples()):
-                with g_cols[idx]:
-                    st.markdown(
-                        f'<div class="metric-card"><h4>{row.Join_Key.upper()}</h4>'
-                        f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
-                        f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
-                        unsafe_allow_html=True
-                    )
-                    # Real world equivalent per 1000 requests
-                    phones, meters, glasses, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
-                    with st.expander("🌍 Impact of 1,000 prompts"):
-                        st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
-                        st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{meters:.1f}** meters driven\n- 🚰 **{glasses:.1f}** glasses of water")
-                    
+            # Integrate Project-Level Water KPIs here
             st.write("")
-            st.markdown("### 🚨 Most Resource Intensive Models (Heavy Footprint)")
-            w_cols = st.columns(len(worst))
-            for idx, row in enumerate(worst.itertuples()):
-                with w_cols[idx]:
-                    st.markdown(
-                        f'<div class="metric-card-danger"><h4>{row.Join_Key.upper()}</h4>'
-                        f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
-                        f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
-                        unsafe_allow_html=True
-                    )
-                    # Real world equivalent per 1000 requests
-                    phones, meters, glasses, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
-                    with st.expander("🌍 Impact of 1,000 prompts"):
-                        st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
-                        st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{meters:.1f}** meters driven\n- 🚰 **{glasses:.1f}** glasses of water")
-                    
-            st.divider()
+            df_proj_w = df_proj.copy()
+            df_proj_w['WUE (L/kWh)'] = df_proj_w['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
+            df_proj_w['Water_Consumed_Liters'] = df_proj_w['Energy Consumed - E (kWh)'] * df_proj_w['WUE (L/kWh)']
+            proj_total_water = df_proj_w['Water_Consumed_Liters'].sum()
+            df_proj_w['Water_Intensity_ml_tx'] = (df_proj_w['Water_Consumed_Liters'] * 1000) / df_proj_w['Functional Unit - R (Transactions)'].replace(0, 1)
+            proj_avg_water_int = df_proj_w['Water_Intensity_ml_tx'].mean()
             
-            # FULL RANKING TABLE WITH PROGRESS BARS
-            with st.expander("📊 View Full AI Models Ranking (Best to Worst)", expanded=False):
-                st.caption("All tested AI models sorted by architectural energy intensity (Wh per transaction).")
+            pw1, pw2 = st.columns(2)
+            with pw1:
+                st.markdown(f'<div class="metric-card-water"><h4>Total Water Evaporated</h4><h2>{format_number(proj_total_water)} Liters</h2></div>', unsafe_allow_html=True)
+            with pw2:
+                st.markdown(f'<div class="metric-card-water"><h4>Avg. Water Intensity</h4><h2>{format_number(proj_avg_water_int)} ml/tx</h2></div>', unsafe_allow_html=True)
+
+            # =====================================================================
+            # SDK v2.0 CLEER & GSF PATTERNS COMPARISON
+            # =====================================================================
+            if "v2.0.0" in project_versions and is_ai_proj:
+                st.divider()
+                st.subheader("🚀 Green SDK v2.0: CLEER Methodology & GSF Caching")
+                st.markdown("This section analyzes the environmental savings achieved by **Semantic/Prompt Caching** evaluated through the deterministic CLEER math model.")
                 
-                max_e = model_stats['Energy_Intensity_Wh_tx'].max()
-                max_w = model_stats['Water_Intensity_ml_tx'].max()
+                cleer_df = df_proj[df_proj['SDK_VERSION'] == 'v2.0.0']
+                total_cache_tokens = cleer_df['CACHED_TOKENS'].sum()
                 
-                st.dataframe(
-                    model_stats[['Join_Key', 'Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx']],
-                    column_config={
-                        "Join_Key": "Model Name",
-                        "Energy_Intensity_Wh_tx": st.column_config.ProgressColumn(
-                            "Energy Intensity (Wh/tx)", 
-                            format="%.4f Wh", 
-                            min_value=0, 
-                            max_value=max_e
-                        ),
-                        "Water_Intensity_ml_tx": st.column_config.ProgressColumn(
-                            "Water Intensity (ml/tx)", 
-                            format="%.4f ml", 
-                            min_value=0, 
-                            max_value=max_w
+                if total_cache_tokens > 0:
+                    c1, c2, c3 = st.columns(3)
+                    avg_baseline = cleer_df['BASELINE_SCI_GCO2E'].mean()
+                    avg_cleer = cleer_df['CLEER_SCI_GCO2E'].mean()
+                    
+                    # Yield calculation for display (higher yield is better)
+                    avg_yield = ((avg_baseline - avg_cleer) / avg_baseline) * 100 if avg_baseline > 0 else 0
+                    
+                    c1.metric(label="Baseline (Unoptimized) SCI", value=f"{avg_baseline:.2f} g/tx")
+                    # Normal color makes positive values green
+                    c2.metric(label="CLEER (Cache-Aware) SCI", value=f"{avg_cleer:.2f} g/tx", delta=f"{avg_yield:.1f}% Yield", delta_color="normal")
+                    c3.metric(label="Tokens Served From Cache", value=f"{format_number(total_cache_tokens)}")
+                    
+                    # Chart Baseline vs CLEER
+                    cleer_chart_df = cleer_df.groupby('AI_MODEL_NAME')[['BASELINE_SCI_GCO2E', 'CLEER_SCI_GCO2E']].mean().reset_index()
+                    fig_cleer = go.Figure()
+                    fig_cleer.add_trace(go.Bar(name='Baseline SCI (Unoptimized)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['BASELINE_SCI_GCO2E'], marker_color='#e74c3c'))
+                    fig_cleer.add_trace(go.Bar(name='CLEER SCI (Cache-Aware)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['CLEER_SCI_GCO2E'], marker_color='#2ecc71'))
+                    fig_cleer.update_layout(barmode='group', title="Methodology Comparison per Model")
+                    st.plotly_chart(fig_cleer, use_container_width=True)
+                else:
+                    st.info("ℹ️ No cached tokens detected yet for this project using v2.0.0. Ensure your LLM calls are structured to leverage provider caching.")
+
+            # =====================================================================
+            # PRE VS POST OPTIMIZATION SAVINGS MODULE
+            # =====================================================================
+            if df_proj['Is_Post'].any():
+                st.divider()
+                st.subheader("📉 Optimization Trajectory & Savings (Pre vs Post)")
+                
+                df_pre_all = df_proj[~df_proj['Is_Post']]
+                df_post_all = df_proj[df_proj['Is_Post']]
+                
+                pre_steps = set(df_pre_all['Clean_Step'].unique())
+                post_steps = set(df_post_all['Clean_Step'].unique())
+                matching_steps = pre_steps.intersection(post_steps)
+                
+                if not matching_steps:
+                    st.warning("⚠️ No matching baseline steps found for the uploaded Post-Optimization data.")
+                else:
+                    df_pre = df_pre_all[df_pre_all['Clean_Step'].isin(matching_steps)]
+                    df_post = df_post_all[df_post_all['Clean_Step'].isin(matching_steps)]
+                    
+                    pre_carbon_total = df_pre['Total Carbon Footprint (g CO2e)'].sum()
+                    post_carbon_total = df_post['Total Carbon Footprint (g CO2e)'].sum()
+                    
+                    compare_data = pd.DataFrame({
+                        'Phase': ['Baseline', 'Post-Optimization'],
+                        'Carbon Footprint (gCO2e)': [pre_carbon_total, post_carbon_total]
+                    })
+                    if is_ai_proj:
+                        pre_cost_total = df_pre['Estimated_Cost_$'].sum()
+                        post_cost_total = df_post['Estimated_Cost_$'].sum()
+                        compare_data['Financial Cost ($)'] = [pre_cost_total, post_cost_total]
+                        
+                        g1, g2 = st.columns(2)
+                        with g1:
+                            fig_comp_carbon = px.bar(
+                                compare_data, x='Phase', y='Carbon Footprint (gCO2e)', color='Phase',
+                                title='Carbon Reduction Overview', text_auto='.2f',
+                                color_discrete_map={'Baseline': '#e74c3c', 'Post-Optimization': '#2ecc71'}
+                            )
+                            st.plotly_chart(fig_comp_carbon, use_container_width=True)
+                        with g2:
+                            fig_comp_cost = px.bar(
+                                compare_data, x='Phase', y='Financial Cost ($)', color='Phase',
+                                title='FinOps Savings Overview', text_auto='.4f',
+                                color_discrete_map={'Baseline': '#7f8c8d', 'Post-Optimization': '#3498db'}
+                            )
+                            st.plotly_chart(fig_comp_cost, use_container_width=True)
+                    else:
+                        fig_comp_carbon = px.bar(
+                            compare_data, x='Phase', y='Carbon Footprint (gCO2e)', color='Phase',
+                            title='Carbon Reduction Overview', text_auto='.2f',
+                            color_discrete_map={'Baseline': '#e74c3c', 'Post-Optimization': '#2ecc71'}
                         )
-                    },
-                    use_container_width=True,
-                    hide_index=True
+                        st.plotly_chart(fig_comp_carbon, use_container_width=True)
+
+                    st.markdown("### 📊 Overall Project Savings")
+                    
+                    carbon_saved = pre_carbon_total - post_carbon_total
+                    carbon_pct = (carbon_saved / pre_carbon_total * 100) if pre_carbon_total > 0 else 0
+                    
+                    pre_sci_avg = df_pre['SCI Score (g CO2e/tx)'].mean()
+                    post_sci_avg = df_post['SCI Score (g CO2e/tx)'].mean()
+                    sci_saved = pre_sci_avg - post_sci_avg
+                    sci_pct = (sci_saved / pre_sci_avg * 100) if pre_sci_avg > 0 else 0
+                    
+                    if is_ai_proj:
+                        cost_saved = pre_cost_total - post_cost_total
+                        cost_pct = (cost_saved / pre_cost_total * 100) if pre_cost_total > 0 else 0
+                        
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Total Carbon Reduction", f"{format_number(carbon_saved)} gCO₂e", f"{format_number(-carbon_pct)}%", delta_color="inverse")
+                        m2.metric("SCI Reduction", f"{format_number(sci_saved)} g/tx", f"{format_number(-sci_pct)}%", delta_color="inverse")
+                        m3.metric("Total FinOps Savings", f"${format_number(cost_saved)}", f"{format_number(-cost_pct)}%", delta_color="inverse")
+                    else:
+                        m1, m2 = st.columns(2)
+                        m1.metric("Total Carbon Reduction", f"{format_number(carbon_saved)} gCO₂e", f"{format_number(-carbon_pct)}%", delta_color="inverse")
+                        m2.metric("SCI Reduction", f"{format_number(sci_saved)} g/tx", f"{format_number(-sci_pct)}%", delta_color="inverse")
+                    
+                    st.divider()
+                    st.markdown("### 🔍 Granular Step-by-Step Savings")
+                    
+                    step_results = {}
+                    for step in matching_steps:
+                        pre_c = df_pre[df_pre['Clean_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum()
+                        post_c = df_post[df_post['Clean_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum()
+                        saved_c = pre_c - post_c
+                        pct_c = (saved_c / pre_c * 100) if pre_c > 0 else 0
+                        
+                        pre_sci = df_pre[df_pre['Clean_Step'] == step]['SCI Score (g CO2e/tx)'].mean()
+                        post_sci = df_post[df_post['Clean_Step'] == step]['SCI Score (g CO2e/tx)'].mean()
+                        saved_sci = pre_sci - post_sci
+                        pct_sci = (saved_sci / pre_sci * 100) if pre_sci > 0 else 0
+
+                        step_results[step] = {'saved': saved_c, 'pct': pct_c, 'pre': pre_c, 'post': post_c, 'saved_sci': saved_sci, 'pct_sci': pct_sci}
+                    
+                    cols = st.columns(3) 
+                    col_idx = 0
+                    for step, metrics in step_results.items():
+                        with cols[col_idx % 3]:
+                            with st.container(border=True):
+                                st.markdown(f"**`{step}`**")
+                                if is_ai_proj:
+                                    step_pre_cost = df_pre[df_pre['Clean_Step'] == step]['Estimated_Cost_$'].sum()
+                                    step_post_cost = df_post[df_post['Clean_Step'] == step]['Estimated_Cost_$'].sum()
+                                    step_cost_saved = step_pre_cost - step_post_cost
+                                    step_cost_pct = (step_cost_saved / step_pre_cost * 100) if step_pre_cost > 0 else 0
+                                    
+                                    st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
+                                    st.metric("FinOps Savings", f"${format_number(step_cost_saved)}", f"{format_number(-step_cost_pct)}%", delta_color="inverse")
+                                else:
+                                    st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
+                        col_idx += 1
+
+            st.write("")
+            st.divider()
+            st.markdown("### 📊 Benchmark & Real-World Context")
+            
+            project_avg_scis = filtered_df.groupby('Project')['SCI Score (g CO2e/tx)'].mean()
+            global_sci_stats = project_avg_scis.describe()
+            global_median_sci = project_avg_scis.median()
+            
+            col_bench1, col_bench2 = st.columns(2)
+            project_totals = filtered_df.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum()
+            global_median_carbon = project_totals.median()
+            with col_bench1:
+                st.markdown("**1. Absolute Environmental Impact (Total Carbon)**")
+                if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon):
+                    if proj_total_carbon > global_median_carbon:
+                        st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
+                    else:
+                        st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
+            
+            with col_bench2:
+                st.markdown("**2. Software Code Efficiency (Average SCI)**")
+                if pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
+                    if proj_avg_sci > global_median_sci:
+                        st.warning(f"⚠️ **Opportunity for Improvement:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **higher** than the global median ({format_number(global_median_sci)} g/tx).")
+                    else:
+                        st.success(f"🌱 **High Efficiency:** This project's intensity per transaction ({format_number(proj_avg_sci)} g/tx) is **lower** (better) than the global median ({format_number(global_median_sci)} g/tx).")
+
+            st.caption("*Note: A project like a high-traffic AI model might have a large Total Carbon footprint due to high user demand, while maintaining a highly efficient SCI score per request.*")
+            st.write("")
+            st.markdown("#### 🧠 Executive Insight")
+            
+            if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon) and pd.notna(proj_avg_sci) and pd.notna(global_median_sci):
+                is_high_carbon = proj_total_carbon > global_median_carbon
+                is_high_sci = proj_avg_sci > global_median_sci
+                
+                if is_high_carbon and not is_high_sci:
+                    st.success(
+                        "**Scale with Efficiency:** While the total footprint reflects a massive processing volume, the SCI score remains below the global average. "
+                        "This indicates the software architecture is successfully handling high demand with strong per-transaction efficiency. "
+                        "The footprint is driven by business growth, not architectural waste."
+                    )
+                elif not is_high_carbon and is_high_sci:
+                    st.info(
+                        "**Early Optimization Opportunity:** Current absolute emissions are kept low by moderate usage volumes. "
+                        "However, the higher-than-average SCI suggests there is room to refine the code. "
+                        "Addressing this proactively will prevent disproportionate cloud costs and emissions as the project scales."
+                    )
+                elif is_high_carbon and is_high_sci:
+                    st.warning(
+                        "**High-Impact Optimization Area:** This project operates at a significant scale and currently shows a higher-than-average SCI. "
+                        "This presents an excellent opportunity: even minor architectural or code-level optimizations here will yield massive, "
+                        "highly visible reductions in both global CO₂ emissions and financial operating costs."
+                    )
+                else:
+                    st.success(
+                        "**Sustainable Baseline:** This project currently operates with both a low absolute footprint and a highly efficient SCI score. "
+                        "It serves as a strong internal benchmark for Green Software best practices."
+                    )
+            
+            st.write("")
+            
+            st.markdown("#### 🌍 Real-World Equivalents & Intensity Context")
+            
+            if is_ai_proj:
+                st.info(f"💡 **Intensity Context (AI):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, an average ChatGPT or Gemini text prompt emits between **2.0 and 3.0 gCO₂e**.")
+            else:
+                st.info(f"💡 **Intensity Context (Standard):** This project's average SCI is **{format_number(proj_avg_sci)} gCO₂e/tx**. For comparison, a standard Google web search emits roughly **0.2 gCO₂e**.")
+
+            if proj_total_energy > 0 or proj_total_carbon > 0:
+                if is_ai_proj:
+                    total_wh = proj_total_energy * 1000
+                    gemini_queries_eq = total_wh / 0.24 if total_wh > 0 else 0
+                    
+                    microwave_seconds = gemini_queries_eq * 1
+                    fridge_seconds = gemini_queries_eq * 6
+                    
+                    microwave_str = format_time_duration(microwave_seconds)
+                    fridge_str = format_time_duration(fridge_seconds)
+                    
+                    st.info(
+                        f"💡 **Energy Context (AI):** The {format_number(proj_total_energy)} kWh used by this project equals **{format_number(total_wh)} Wh**. "
+                        f"According to recent Google estimates, a standard Gemini text query uses 0.24 Wh. "
+                        f"This project's total energy is equivalent to running a microwave for **{microwave_str}** or a standard fridge for **{fridge_str}**."
+                    )
+                else:
+                    if proj_total_carbon < 8.0:
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
+                    else:
+                        smartphones = int(proj_total_carbon / 8.0)
+                        km_driven = proj_total_carbon / 192.0
+                        
+                        if km_driven < 1:
+                            st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
+                        else:
+                            st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**.")
+                    
+                uk_annual_carbon_g = 7000000.0 # 7 tonnes
+                pct_of_uk_citizen = (proj_total_carbon / uk_annual_carbon_g) * 100
+                
+                st.info(
+                    f"💡 **Carbon Context:** The average UK citizen emits 7 tonnes of CO₂ annually from energy and industry. "
+                    f"This project's total footprint ({format_number(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
+                )
+            else:
+                st.info("💡 **Context:** The recorded energy and carbon totals for this timeframe are currently **0**. Process more data to see real-world equivalents.")
+
+            if selected_proj_drill == "Galileo":
+                st.info(
+                    "**Galileo Telemetry Data Notes:**\n\n"
+                    "• **Token Aggregation:** The raw dataset provides a single combined 'Tokens' count. Since the exact split between prompt and completion tokens is unavailable, all consumed tokens have been aggregated and logged under `PROMPT_TOKENS`.\n\n"
+                    "• **Data Filtering & Integrity:** The initial raw dataset contained over 2,500 entries. To maintain accurate SCI and carbon calculations, rows with an 'Unknown' provider were excluded. A final filter to match supported and recognized AI models finalized the dataset at exactly **186 valid rows**."
                 )
 
-            st.markdown("### 🎯 Actionable Recommendations")
-            st.success("**Recommendation:** Whenever possible, fallback to smaller, purpose-built models like **Claude 3.5 Haiku** or **GPT-4o-mini** instead of their heavier counterparts (Sonnet/Opus/GPT-4) for summarization, RAG, or routing tasks. These lightweight models are heavily optimized by hyperscalers, typically operating up to **4x more energy-efficiently** and evaporating up to **80% less direct water** per prompt. Only default to high-intensity models for complex reasoning or highly creative tasks.")
+            if selected_proj_drill == "Archimedes Lever":
+                st.warning(
+                    "**Proxy Model Estimation (Archimedes Lever):**\n\n"
+                    "The baseline telemetry for this project was originally recorded using Anthropic's 'Opus 5'. "
+                    "Since this specific model version is not yet supported by standard carbon tracking APIs, "
+                    "the footprint and costs were calculated using **Claude 3 Opus** as an accurate proxy model.\n\n"
+                    "**Why Claude 3 Opus?**\n"
+                    "We selected this model because it belongs to the same flagship 'Opus' architectural tier. "
+                    "It shares the closest parameter scale, computational density, and hardware utilization profile. "
+                    "Consequently, its energy consumption per token (Wh/token) provides the most mathematically accurate baseline available to estimate the carbon emissions of a next-generation Opus model."
+                )
+
+            df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
+            df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
+            
+            group_col_table = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
+            breakdown_table = df_proj.groupby(group_col_table).agg({
+                'SCI Score (g CO2e/tx)': 'mean',
+                'Energy Consumed - E (kWh)': 'sum', 
+                'Total Carbon Footprint (g CO2e)': 'sum', 
+                'Estimated_Cost_$': 'sum',
+                'MEASUREMENT_PERIOD': 'first'
+            }).reset_index()
+            
+            breakdown_table = breakdown_table.rename(columns={
+                group_col_table: 'Component / Step', 
+                'SCI Score (g CO2e/tx)': 'Average SCI Score (g CO2e/tx)',
+                'MEASUREMENT_PERIOD': 'Original Period'
+            })
+            
+            formatted_breakdown = format_dataframe_display(breakdown_table)
+            if 'Estimated_Cost_$' in formatted_breakdown.columns:
+                formatted_breakdown['Estimated_Cost_$'] = breakdown_table['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
+                
+            st.dataframe(formatted_breakdown, use_container_width=True)
+            
+            if df_proj['Is_Post'].any():
+                chart_view_phase = st.selectbox("Select Phase to visualize in Breakdown:", options=["Baseline", "Post-Optimization"])
+                chart_df = df_proj[df_proj['Status'] == chart_view_phase].copy()
+            else:
+                chart_df = df_proj.copy()
+            
+            group_col_chart = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
+            
+            breakdown_chart = chart_df.groupby(group_col_chart).agg({
+                'Total Carbon Footprint (g CO2e)': 'sum',
+                'Estimated_Cost_$': 'sum',
+                'SCI Score (g CO2e/tx)': 'mean'
+            }).reset_index().rename(columns={group_col_chart: 'Component / Step'})
+
+            num_items = len(breakdown_chart)
+            is_horizontal = num_items >= 8
+            orientation_flag = 'h' if is_horizontal else 'v'
+            
+            breakdown_chart = breakdown_chart.sort_values(by='Total Carbon Footprint (g CO2e)', ascending=is_horizontal)
+            dynamic_chart_height = max(450, num_items * 25) if is_horizontal else 450
+            
+            x_carbon = 'Total Carbon Footprint (g CO2e)' if is_horizontal else 'Component / Step'
+            y_carbon = 'Component / Step' if is_horizontal else 'Total Carbon Footprint (g CO2e)'
+            
+            x_cost = 'Estimated_Cost_$' if is_horizontal else 'Component / Step'
+            y_cost = 'Component / Step' if is_horizontal else 'Estimated_Cost_$'
+
+            x_sci = 'SCI Score (g CO2e/tx)' if is_horizontal else 'Component / Step'
+            y_sci = 'Component / Step' if is_horizontal else 'SCI Score (g CO2e/tx)'
+
+            st.write("") 
+
+            fig_drill_carbon = px.bar(
+                breakdown_chart, x=x_carbon, y=y_carbon, color='Component / Step',
+                title="Carbon Impact Breakdown (Total gCO₂e)", 
+                orientation=orientation_flag, height=dynamic_chart_height,
+                color_discrete_sequence=DARK_PURPLES
+            )
+            st.plotly_chart(fig_drill_carbon, use_container_width=True)
+            
+            breakdown_chart_sci = breakdown_chart.sort_values(by='SCI Score (g CO2e/tx)', ascending=is_horizontal)
+            fig_drill_sci = px.bar(
+                breakdown_chart_sci, x=x_sci, y=y_sci, color='Component / Step',
+                title="Intensity Impact Breakdown (Average SCI - gCO₂e/tx)", 
+                orientation=orientation_flag, height=dynamic_chart_height,
+                color_discrete_sequence=px.colors.sequential.Greens[::-1]  
+            )
+            st.plotly_chart(fig_drill_sci, use_container_width=True)
+
+            if is_ai_proj:
+                fig_drill_cost = px.bar(
+                    breakdown_chart, x=x_cost, y=y_cost, color='Component / Step',
+                    title="Cost Impact Breakdown ($)", 
+                    orientation=orientation_flag, height=dynamic_chart_height,
+                    color_discrete_sequence=DARK_BLUES
+                )
+                st.plotly_chart(fig_drill_cost, use_container_width=True)
+
+    # =====================================================================
+    # TAB 2: GLOBAL OVERVIEW
+    # =====================================================================
+    with tab_global:
+        st.subheader("🌍 Global Impact Overview (Run Rate Projection)")
+        st.markdown("Compare the true environmental and financial impact of all projects scaled to a unified timeframe.")
+        
+        target_scale_global = st.radio(
+            "⏱️ Project all metrics to:", 
+            options=["Raw Data (No Scaling)", "Hourly (1h)", "Daily (24h)", "Monthly (730h)", "Yearly (8760h)"],
+            horizontal=True,
+            key="global_scale"
+        )
+        scale_map = {"Hourly (1h)": 1, "Daily (24h)": 24, "Monthly (730h)": 730, "Yearly (8760h)": 8760}
+        df_global_scaled = filtered_df.copy()
+        
+        if 'MEASUREMENT_PERIOD' not in df_global_scaled.columns:
+            df_global_scaled['MEASUREMENT_PERIOD'] = np.nan
+            
+        df_global_scaled['MEASUREMENT_PERIOD'] = df_global_scaled.apply(
+            lambda row: KNOWN_PERIODS.get(row['Project'], "Unknown") if pd.isna(row['MEASUREMENT_PERIOD']) else row['MEASUREMENT_PERIOD'], 
+            axis=1
+        )
+        
+        if target_scale_global != "Raw Data (No Scaling)":
+            target_hours = scale_map[target_scale_global]
+            scale_cols = ['Total Carbon Footprint (g CO2e)', 'Energy Consumed - E (kWh)', 'Estimated_Cost_$', 'Embodied Emissions - M (g CO2e)', 'Operational_Emissions_gCO2e', 'Functional Unit - R (Transactions)']
+            
+            def scale_global_row(row):
+                base_hours = parse_period_to_hours(row['MEASUREMENT_PERIOD'])
+                if base_hours and base_hours > 0:
+                    mult = target_hours / base_hours
+                    for col in scale_cols:
+                        if col in row.index and pd.notna(row[col]):
+                            row[col] = row[col] * mult
+                return row
+                
+            df_global_scaled = df_global_scaled.apply(scale_global_row, axis=1)
+
+        st.divider()
+
+        st.subheader("📋 Telemetry Registry (`CO_SOFTWARE_CARBON_INTENSITY`)")
+        
+        base_cols = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'Component / Step' if 'Component / Step' in df_global_scaled.columns else 'PROCESS_DESC']
+        display_cols = [c for c in base_cols if c in df_global_scaled.columns]
+        
+        other_cols = ['Total Carbon Footprint (g CO2e)', 'Functional Unit Details', 'IS_AI']
+        display_cols.extend([c for c in other_cols if c in df_global_scaled.columns])
+        display_cols.extend([col for col in df_global_scaled.columns if col not in display_cols and col != 'Join_Key' and col != 'MEASUREMENT_METHOD'])
+        
+        df_display_tab1 = format_dataframe_display(df_global_scaled[display_cols].sort_values(by="Date", ascending=False))
+        st.dataframe(df_display_tab1, use_container_width=True)
+        
+        st.divider()
+
+        st.subheader(f"📈 Key Impact Metrics ({target_scale_global})")
+        m1, m2, m3, m4 = st.columns(4)
+        total_carbon = df_global_scaled['Total Carbon Footprint (g CO2e)'].sum()
+        avg_sci = df_global_scaled['SCI Score (g CO2e/tx)'].mean()
+        total_energy = df_global_scaled['Energy Consumed - E (kWh)'].sum()
+        
+        max_su_idx = df_global_scaled['SCI Score (g CO2e/tx)'].idxmax()
+        max_su = df_global_scaled.loc[max_su_idx]['SCI Tracker ID'] if pd.notna(max_su_idx) else "N/A"
+        
+        with m1:
+            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(total_energy)} kWh</h2></div>', unsafe_allow_html=True)
+        with m4:
+            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su}</h2></div>', unsafe_allow_html=True)
+
+        st.divider()
+        
+        tab1_phases = st.multiselect(
+            "⚖️ Select Phase (Filters footprint distribution charts below):", 
+            options=["Baseline (Pre)", "Optimized (Post)"],
+            default=["Baseline (Pre)"],
+            key="tab1_phase"
+        )
+        df_tab1 = apply_phase_filter(df_global_scaled, tab1_phases)
+
+        st.subheader(f"📊 Footprint & Workload Distribution ({target_scale_global})")
+        c1, c2 = st.columns(2)
+        with c1:
+            proj_agg = df_tab1.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+            proj_agg = add_percent_to_labels(proj_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
+            fig_pie = px.pie(proj_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Footprint by Project", hole=0.4)
+            fig_pie.update_traces(textinfo='none')
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with c2:
+            df_tab1['Workload_Type'] = df_tab1['IS_AI'].apply(lambda x: 'AI / LLM Inference' if x == 1 else 'Standard Code')
+            ai_agg = df_tab1.groupby('Workload_Type')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+            fig_ai = px.bar(ai_agg, x='Workload_Type', y='Total Carbon Footprint (g CO2e)', title="Footprint by Workload Type", color='Workload_Type', color_discrete_map={'Standard Code': '#2ecc71', 'AI / LLM Inference': '#9b59b6'})
+            st.plotly_chart(fig_ai, use_container_width=True)
+
+        st.divider()
+        
+        st.subheader("⚡ Average SCI Breakdown: Operational (E × I) vs Embodied Carbon (M)")
+        st.info("SCI is an intensity ratio (gCO₂e per transaction). It remains constant regardless of the selected time projection.")
+        
+        lifespan_years = st.slider("Hardware Lifespan Simulator (Years)", min_value=1, max_value=10, value=4, step=1, key="global_lifespan")
+        df_grouped = df_tab1.groupby('Project').agg({
+            'Embodied Emissions - M (g CO2e)': 'sum', 
+            'Operational_Emissions_gCO2e': 'sum', 
+            'Functional Unit - R (Transactions)': 'sum'
+        }).reset_index()
+        
+        df_grouped['M_Adjusted'] = df_grouped['Embodied Emissions - M (g CO2e)'] / lifespan_years
+        df_grouped['Embodied_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['M_Adjusted'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
+        df_grouped['Operational_gCO2e_tx'] = np.where(df_grouped['Functional Unit - R (Transactions)'] > 0, df_grouped['Operational_Emissions_gCO2e'] / df_grouped['Functional Unit - R (Transactions)'], 0.0)
+
+        fig_stack = go.Figure(data=[
+            go.Bar(name='Operational Emissions (E × I / R)', x=df_grouped['Project'], y=df_grouped['Operational_gCO2e_tx'], marker_color='#2ecc71'),
+            go.Bar(name='Embodied Emissions (M / R)', x=df_grouped['Project'], y=df_grouped['Embodied_gCO2e_tx'], marker_color='#e74c3c')
+        ])
+        fig_stack.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
+        
+        global_avg_sci = df_tab1['SCI Score (g CO2e/tx)'].mean()
+        if pd.notna(global_avg_sci):
+            fig_stack.add_hline(y=global_avg_sci, line_dash="dash", line_color="gray", 
+                                annotation_text=f"Global Avg SCI: {global_avg_sci:.2f}", 
+                                annotation_position="top left")
+        
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+        st.divider()
+        st.header("💻 Standard Code vs 🧠 AI Models Analysis")
+        sub_tab_std, sub_tab_ai = st.tabs(["💻 Standard Code", "🧠 AI Models & FinOps"])
+        
+        with sub_tab_std:
+            df_std_base = filtered_df[filtered_df['IS_AI'] == 0].copy()
+            if df_std_base.empty:
+                st.info("No standard code telemetry found in the selected projects.")
+            else:
+                st.subheader("📋 Standard Projects Registry")
+                display_cols_std = [c for c in display_cols if c in df_std_base.columns and c != 'Join_Key']
+                
+                df_display_tab2 = format_dataframe_display(df_std_base[display_cols_std].sort_values(by="Date", ascending=False))
+                st.dataframe(df_display_tab2, use_container_width=True)
+                st.divider()
+                tab2_phases = st.multiselect(
+                    "⚖️ Select Phase (Filters KPIs and charts below):", 
+                    options=["Baseline (Pre)", "Optimized (Post)"],
+                    default=["Baseline (Pre)"],
+                    key="tab2_phase"
+                )
+                df_tab2 = apply_phase_filter(df_std_base, tab2_phases)
+
+                st.subheader("📈 Standard Code KPIs")
+                s1, s2, s3, s4 = st.columns(4)
+                with s1:
+                    st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_number(df_tab2["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+                with s2:
+                    st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_number(df_tab2["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+                with s3:
+                    st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(df_tab2["Energy Consumed - E (kWh)"].sum())} kWh</h2></div>', unsafe_allow_html=True)
+                with s4:
+                    max_su_idx_std = df_tab2['SCI Score (g CO2e/tx)'].idxmax() if not df_tab2.empty else None
+                    max_su_std = df_tab2.loc[max_su_idx_std]['SCI Tracker ID'] if pd.notna(max_su_idx_std) else "N/A"
+                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_std}</h2></div>', unsafe_allow_html=True)
+                
+                st.divider()
+                st.subheader("📊 Standard Projects Overview")
+                c3, c4 = st.columns(2)
+                with c3:
+                    std_agg = df_tab2.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+                    std_agg = add_percent_to_labels(std_agg, 'Total Carbon Footprint (g CO2e)', 'Project')
+                    fig_pie_std = px.pie(std_agg, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by Standard Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                    fig_pie_std.update_traces(textinfo='none')
+                    st.plotly_chart(fig_pie_std, use_container_width=True)
+                with c4:
+                    st.markdown("**(Hardware Lifespan Simulator)**")
+                    lifespan_std = st.slider("Lifespan (Years)", min_value=1, max_value=10, value=4, step=1, key="std_lifespan")
+                    df_std_grp = df_tab2.groupby('Project').agg({'Embodied Emissions - M (g CO2e)': 'sum', 'Operational_Emissions_gCO2e': 'sum', 'Functional Unit - R (Transactions)': 'sum'}).reset_index()
+                    df_std_grp['M_Adjusted'] = df_std_grp['Embodied Emissions - M (g CO2e)'] / lifespan_std
+                    df_std_grp['Embodied_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['M_Adjusted'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
+                    df_std_grp['Operational_gCO2e_tx'] = np.where(df_std_grp['Functional Unit - R (Transactions)'] > 0, df_std_grp['Operational_Emissions_gCO2e'] / df_std_grp['Functional Unit - R (Transactions)'], 0.0)
+                    
+                    fig_stack_std = go.Figure(data=[
+                        go.Bar(name='Operational', x=df_std_grp['Project'], y=df_std_grp['Operational_gCO2e_tx'], marker_color='#2ecc71'),
+                        go.Bar(name='Embodied', x=df_std_grp['Project'], y=df_std_grp['Embodied_gCO2e_tx'], marker_color='#e74c3c')
+                    ])
+                    fig_stack_std.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
+                    std_avg_sci = df_tab2['SCI Score (g CO2e/tx)'].mean()
+                    if pd.notna(std_avg_sci):
+                        fig_stack_std.add_hline(y=std_avg_sci, line_dash="dash", line_color="gray", 
+                                                annotation_text=f"Std Avg SCI: {std_avg_sci:.2f}", 
+                                                annotation_position="top left")
+                                                
+                    st.plotly_chart(fig_stack_std, use_container_width=True) 
+
+        with sub_tab_ai:
+            df_ai_base = filtered_df[filtered_df['IS_AI'] == 1].copy()
+            if df_ai_base.empty:
+                st.info("No AI telemetry found in the selected projects.")
+            else:
+                st.subheader("📋 AI Projects Registry")
+                
+                base_cols_ai = ['Date', 'Project', 'SCI Score (g CO2e/tx)', 'AI_MODEL_NAME']
+                display_cols_ai = [c for c in base_cols_ai if c in df_ai_base.columns]
+                other_cols_ai = ['Total_Tokens', 'Total Carbon Footprint (g CO2e)', 'Estimated_Cost_$']
+                display_cols_ai.extend([c for c in other_cols_ai if c in df_ai_base.columns])
+                
+                display_cols_ai.extend([c for c in df_ai_base.columns if c not in display_cols_ai and c != 'Join_Key' and c != 'MEASUREMENT_METHOD'])
+                
+                formatted_df_ai = df_ai_base.copy()
+                
+                df_display_tab3 = format_dataframe_display(formatted_df_ai[display_cols_ai].sort_values(by="Date", ascending=False))
+                if 'Estimated_Cost_$' in df_display_tab3.columns:
+                    df_display_tab3['Estimated_Cost_$'] = df_ai_base['Estimated_Cost_$'].apply(lambda x: f"${x:,.4f}")
+
+                st.dataframe(df_display_tab3, use_container_width=True)
+                st.divider()
+
+                tab3_phases = st.multiselect(
+                    "⚖️ Select Phase (Filters KPIs and charts below):", 
+                    options=["Baseline (Pre)", "Optimized (Post)"],
+                    default=["Baseline (Pre)"],
+                    key="tab3_phase"
+                )
+                df_tab3 = apply_phase_filter(df_ai_base, tab3_phases)
+
+                st.subheader("📈 AI Code KPIs")
+                a1, a2, a3, a4 = st.columns(4)
+                with a1:
+                    st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_number(df_tab3["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+                with a2:
+                    st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_number(df_tab3["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+                with a3:
+                    st.markdown(f'<div class="metric-card"><h4>Total Tokens</h4><h2>{df_tab3["Total_Tokens"].sum():,.0f}</h2></div>', unsafe_allow_html=True)
+                with a4:
+                    max_ai_idx = df_tab3['SCI Score (g CO2e/tx)'].idxmax() if not df_tab3.empty else None
+                    max_su_ai = df_tab3.loc[max_ai_idx]['SCI Tracker ID'] if pd.notna(max_ai_idx) else "N/A"
+                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_ai}</h2></div>', unsafe_allow_html=True)
+
+                st.divider()
+                st.subheader("📊 AI Analytics & Financial FinOps")
+                
+                ai_agg_proj = df_tab3.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum().reset_index()
+                ai_agg_proj = add_percent_to_labels(ai_agg_proj, 'Total Carbon Footprint (g CO2e)', 'Project')
+                fig_pie_ai = px.pie(ai_agg_proj, values='Total Carbon Footprint (g CO2e)', names='Project', title="Carbon Footprint by AI Project", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                fig_pie_ai.update_traces(textinfo='none')
+                st.plotly_chart(fig_pie_ai, use_container_width=True)
+                
+                st.write("") 
+                
+                total_cost_str = f"${df_tab3['Estimated_Cost_$'].sum():,.4f}"
+                st.markdown(f'<div class="metric-card-ai" style="text-align: center; margin-bottom: 20px;"><h4>Total FinOps Cost Across All AI Projects</h4><h2 style="font-size: 2.5rem !important;">{total_cost_str}</h2></div>', unsafe_allow_html=True)
+                
+                cost_agg_proj = df_tab3.groupby('Project')['Estimated_Cost_$'].sum().reset_index()
+                fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
+                st.plotly_chart(fig_cost_proj, use_container_width=True)
+
+
+    # =====================================================================
+    # TAB 3: WATER FOOTPRINT (DIRECT EVAPORATION)
+    # =====================================================================
+    with tab_water:
+        st.subheader("💧 Water Footprint (Direct Evaporation - Level 1)")
+        st.markdown("""
+        *Calculates direct water consumption in data centers based on Energy (kWh) and verified provider Water Usage Effectiveness (WUE).*
+        """)
+        st.info("**What is Level 1 Water?** It refers to the direct on-site water evaporated by the cooling towers inside the hyperscale data center to keep the servers from overheating. It does not include Level 2 indirect water (e.g., water used by power plants to generate the electricity).")
+        
+        df_water = filtered_df.copy()
+        
+        # 1. Map Provider to WUE
+        df_water['WUE (L/kWh)'] = df_water['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
+        
+        # 2. Mathematical Formula: Water (Liters) = Energy (kWh) * WUE
+        df_water['Water_Consumed_Liters'] = df_water['Energy Consumed - E (kWh)'] * df_water['WUE (L/kWh)']
+        
+        # 3. Water Intensity: (Liters * 1000) / Transactions
+        df_water['Water_Intensity_ml_tx'] = (df_water['Water_Consumed_Liters'] * 1000) / df_water['Functional Unit - R (Transactions)'].replace(0, 1)
+
+        # Top-level Metrics
+        total_water = df_water['Water_Consumed_Liters'].sum()
+        avg_water_intensity = df_water['Water_Intensity_ml_tx'].mean()
+        
+        w1, w2 = st.columns(2)
+        with w1:
+            st.markdown(f'<div class="metric-card-water"><h4>Total Water Evaporated</h4><h2>{format_number(total_water)} Liters</h2></div>', unsafe_allow_html=True)
+        with w2:
+            st.markdown(f'<div class="metric-card-water"><h4>Average Water Intensity</h4><h2>{format_number(avg_water_intensity)} ml/tx</h2></div>', unsafe_allow_html=True)
+        
+        st.divider()
+
+        # --- GLOBAL REAL-WORLD EQUIVALENTS ---
+        st.markdown("### 🚰 Global Real-World Equivalents")
+        if total_water > 0:
+            glasses = int(total_water / 0.25) # 250ml per glass
+            bathtubs = int(total_water / 150) # 150L per standard bathtub
+            pools = total_water / 2500000     # 2.5M L per Olympic pool
+            
+            if total_water >= 2500000:
+                st.info(f"💡 The total water evaporated across these projects is **{format_number(total_water)} liters**. That is equivalent to completely filling **{format_number(pools)} Olympic-sized swimming pools**.")
+            elif total_water >= 150:
+                st.info(f"💡 The total water evaporated is **{format_number(total_water)} liters**. That is equivalent to filling **{format_number(bathtubs)} standard bathtubs** or drinking **{format_number(glasses)} glasses of water**.")
+            else:
+                st.info(f"💡 The total water evaporated is **{format_number(total_water)} liters**. That is equivalent to **{format_number(glasses)} glasses of water**.")
+        else:
+            st.info("💡 No water consumption recorded for the selected filters.")
+
+        st.divider()
+
+        # --- PROJECT DRILL-DOWN (COMPONENT LEVEL) ---
+        st.markdown("### 🔍 Project Water Drill-down")
+        st.caption("Select a specific project to see how water consumption is distributed across its different models or execution steps.")
+        
+        water_proj = st.selectbox("Select Project for Component Analysis:", options=df_water['Project'].unique(), key="water_proj_select")
+        df_w_proj = df_water[df_water['Project'] == water_proj].copy()
+        
+        if not df_w_proj.empty:
+            # --- PROJECT-SPECIFIC REAL-WORLD EQUIVALENT ---
+            proj_total_water = df_w_proj['Water_Consumed_Liters'].sum()
+            if proj_total_water > 0:
+                p_glasses = int(proj_total_water / 0.25)
+                p_bathtubs = int(proj_total_water / 150)
+                p_pools = proj_total_water / 2500000
+                
+                if proj_total_water >= 2500000:
+                    st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_pools)} Olympic pools**.")
+                elif proj_total_water >= 150:
+                    st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_bathtubs)} bathtubs**.")
+                else:
+                    st.success(f"💡 Project **{water_proj}** evaporated **{format_number(proj_total_water)} liters** of water. Equivalent to **{format_number(p_glasses)} glasses**.")
+            else:
+                st.success(f"💡 No water consumption recorded for project **{water_proj}**.")
+
+            # --- GROUP COMPONENT LOGIC ---
+            is_ai_proj_w = df_w_proj['IS_AI'].any()
+            group_col_w = 'AI_MODEL_NAME' if is_ai_proj_w else 'PROCESS_DESC'
+            
+            comp_w_df = df_w_proj.groupby(group_col_w).agg({
+                'Water_Consumed_Liters': 'sum',
+                'Water_Intensity_ml_tx': 'mean'
+            }).reset_index().rename(columns={group_col_w: 'Component / Step'})
+
+            # Implement TOP-10 logic for projects with many steps
+            comp_w_df = comp_w_df.sort_values('Water_Consumed_Liters', ascending=False)
+            num_steps = len(comp_w_df)
+
+            if num_steps > 10:
+                top_10 = comp_w_df.head(10)
+                others_water = comp_w_df.iloc[10:]['Water_Consumed_Liters'].sum()
+                others_int = comp_w_df.iloc[10:]['Water_Intensity_ml_tx'].mean()
+                others_row = pd.DataFrame({
+                    'Component / Step': [f'Others ({num_steps - 10} steps)'],
+                    'Water_Consumed_Liters': [others_water],
+                    'Water_Intensity_ml_tx': [others_int]
+                })
+                comp_w_df_chart = pd.concat([top_10, others_row], ignore_index=True)
+                top_10_pct = (top_10['Water_Consumed_Liters'].sum() / proj_total_water) * 100 if proj_total_water > 0 else 0
+                st.caption(f"**Top-10 Optimization:** Displaying the top 10 consumers, which represent **{top_10_pct:.1f}%** of the total water footprint. The remaining {num_steps - 10} steps are aggregated as 'Others'.")
+            else:
+                comp_w_df_chart = comp_w_df.copy()
+
+            # --- DYNAMIC CHART LAYOUT ---
+            chart_items = len(comp_w_df_chart)
+            dynamic_height = max(450, chart_items * 35)
+
+            if chart_items > 5:
+                # HORIZONTAL LAYOUT (Stacked vertically)
+                fig_w_tot = px.bar(
+                    comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=True), 
+                    x='Water_Consumed_Liters', y='Component / Step', 
+                    title="Total Absolute Water (Liters)", 
+                    orientation='h',
+                    height=dynamic_height,
+                    color_discrete_sequence=['#3498db']
+                )
+                st.plotly_chart(fig_w_tot, use_container_width=True)
+                
+                fig_w_int = px.bar(
+                    comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=True), 
+                    x='Water_Intensity_ml_tx', y='Component / Step', 
+                    title="Water Efficiency (ml per transaction)", 
+                    orientation='h',
+                    height=dynamic_height,
+                    color_discrete_sequence=['#2980b9']
+                )
+                st.plotly_chart(fig_w_int, use_container_width=True)
+                
+            else: # VERTICAL LAYOUT (Side-by-side)
+                col_w_chart1, col_w_chart2 = st.columns(2)
+                with col_w_chart1:
+                    fig_w_tot = px.bar(
+                        comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=False), 
+                        x='Component / Step', y='Water_Consumed_Liters', 
+                        title="Total Absolute Water (Liters)", 
+                        orientation='v',
+                        color_discrete_sequence=['#3498db']
+                    )
+                    st.plotly_chart(fig_w_tot, use_container_width=True)
+                    
+                with col_w_chart2:
+                    fig_w_int = px.bar(
+                        comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=False), 
+                        x='Component / Step', y='Water_Intensity_ml_tx', 
+                        title="Water Efficiency (ml per transaction)", 
+                        orientation='v',
+                        color_discrete_sequence=['#2980b9']
+                    )
+                    st.plotly_chart(fig_w_int, use_container_width=True)
+
+            # --- AUTOMATED INSIGHTS GENERATOR (APPLES-TO-APPLES) ---
+            st.write("")
+            st.markdown("#### 💧 Automated Water Efficiency Insights")
+            if not comp_w_df.empty and len(comp_w_df) > 1:
+                # Emphasize that intensity (ml/tx) is the true efficiency metric
+                best_idx = comp_w_df['Water_Intensity_ml_tx'].idxmin()
+                worst_idx = comp_w_df['Water_Intensity_ml_tx'].idxmax()
+                
+                if pd.notna(best_idx) and pd.notna(worst_idx):
+                    best_row = comp_w_df.loc[best_idx]
+                    worst_row = comp_w_df.loc[worst_idx]
+                    
+                    best_ml = best_row['Water_Intensity_ml_tx']
+                    worst_ml = worst_row['Water_Intensity_ml_tx']
+                    
+                    multiplier = (worst_ml / best_ml) if best_ml > 0 else 0
+                    mult_str = f"**{multiplier:.1f}x more**" if multiplier > 0 else "significantly more"
+                    
+                    st.info(f"💡 **Apples-to-Apples Comparison:** To truly understand efficiency, we must look at the cost per transaction. "
+                            f"**'{best_row['Component / Step']}'** is your greenest and most efficient component here, evaporating only **{format_number(best_ml)} ml** per prompt. "
+                            f"Conversely, **'{worst_row['Component / Step']}'** is the most water-intensive, consuming **{format_number(worst_ml)} ml** per prompt "
+                            f"({mult_str} than the most efficient one).\n\n"
+                            f"*Note: A high 'Total Absolute Water' bar just means a component is called frequently, but intensity (ml/tx) reveals its architectural efficiency.*")
+
+        st.divider()
+        
+        # --- AI VS STANDARD CONTEXT ---
+        st.subheader("⚖️ AI vs Standard Software: Water Intensity")
+        with st.expander("Why might AI show lower intensity (ml/tx) despite consuming more total water?"):
+            st.markdown("""
+            1. **Cloud Efficiency (WUE):** AI models typically run on hyperscale cloud providers (AWS, GCP) with highly optimized liquid cooling (WUE ~0.20 L/kWh). Standard code often runs on legacy or on-premise servers with less efficient cooling (WUE ~1.80 L/kWh).
+            2. **Transaction Volume (The Denominator):** AI pipelines often process millions of tokens (transactions), mathematically diluting the water cost per single transaction, whereas a standard script might execute once but take minutes to run.
+            """)
+        
+        df_water['Workload_Type'] = df_water['IS_AI'].apply(lambda x: "AI Project" if x == 1 else "Standard Software")
+        comp_water_df = df_water.groupby('Workload_Type')['Water_Intensity_ml_tx'].mean().reset_index()
+        
+        fig_water = px.bar(
+            comp_water_df, 
+            x='Workload_Type', 
+            y='Water_Intensity_ml_tx',
+            color='Workload_Type',
+            title="Average Water Consumption per Transaction (ml/tx)",
+            labels={'Water_Intensity_ml_tx': 'Water Intensity (ml/tx)', 'Workload_Type': 'Category'},
+            color_discrete_map={'Standard Software': '#2ecc71', 'AI Project': '#8e44ad'},
+            text_auto='.2f'
+        )
+        st.plotly_chart(fig_water, use_container_width=True)
+
+        # --- RAW DATA ---
+        st.subheader("🗂️ Raw Water Telemetry")
+        water_display_cols = ['Project', 'PROCESS_DESC', 'AI_MODEL_NAME', 'PROVIDER', 'WUE (L/kWh)', 'Energy Consumed - E (kWh)', 'Water_Consumed_Liters', 'Water_Intensity_ml_tx']
+        valid_w_cols = [c for c in water_display_cols if c in df_water.columns]
+        st.dataframe(format_dataframe_display(df_water[valid_w_cols]), use_container_width=True)
+
+    # =====================================================================
+    # TAB 4: AI MODELS BENCHMARK & INSIGHTS
+    # =====================================================================
+    with tab_insights:
+        st.subheader("💡 AI Models Benchmark & Insights")
+        st.markdown("Analyze raw environmental performance across all AI models irrespective of the specific project to inform architectural decisions.")
+        
+        df_ai_ins = filtered_df[filtered_df['IS_AI'] == 1].copy()
+        
+        if df_ai_ins.empty:
+            st.info("No AI telemetry found to generate benchmark insights.")
+        else:
+            # Calculate water metrics for all AI rows
+            df_ai_ins['WUE (L/kWh)'] = df_ai_ins['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
+            df_ai_ins['Water_Consumed_Liters'] = df_ai_ins['Energy Consumed - E (kWh)'] * df_ai_ins['WUE (L/kWh)']
+            
+            # Group by the normalized AI model name
+            model_stats = df_ai_ins.groupby('Join_Key').agg({
+                'Energy Consumed - E (kWh)': 'sum',
+                'Water_Consumed_Liters': 'sum',
+                'Total_Tokens': 'sum',
+                'Functional Unit - R (Transactions)': 'sum',
+                'Estimated_Cost_$': 'sum'
+            }).reset_index()
+            
+            # FIX: Standardize the AI benchmark to "1,000 Tokens" per transaction to guarantee apples-to-apples.
+            # This prevents magnitude errors if a project logged raw tokens as Functional Units (like Galileo).
+            model_stats['Benchmark_Denominator'] = np.where(
+                model_stats['Total_Tokens'] > 0, 
+                model_stats['Total_Tokens'] / 1000.0, 
+                model_stats['Functional Unit - R (Transactions)']
+            )
+
+            model_stats['Benchmark_Denominator'] = model_stats['Benchmark_Denominator'].replace(0, 1)
+            
+            # Calculate strict intensity metrics (Wh per standard 1K prompt and ml per standard 1K prompt)
+            model_stats['Energy_Intensity_Wh_tx'] = (model_stats['Energy Consumed - E (kWh)'] * 1000) / model_stats['Benchmark_Denominator']
+            model_stats['Water_Intensity_ml_tx'] = (model_stats['Water_Consumed_Liters'] * 1000) / model_stats['Benchmark_Denominator']
+            
+            # Filter valid interactions
+            model_stats = model_stats[model_stats['Benchmark_Denominator'] > 0]
+            
+            if not model_stats.empty:
+                model_stats = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'])
+                
+                greenest = model_stats.head(3)
+                worst = model_stats.sort_values(by=['Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx'], ascending=False).head(3)
+                
+                st.markdown("### 🏆 Top Resource Efficient Models")
+                g_cols = st.columns(len(greenest))
+                for idx, row in enumerate(greenest.itertuples()):
+                    with g_cols[idx]:
+                        st.markdown(
+                            f'<div class="metric-card"><h4>{row.Join_Key.upper()}</h4>'
+                            f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
+                            f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
+                            unsafe_allow_html=True
+                        )
+                        # Real world equivalent per 1000 requests
+                        phones, km, w_val, w_unit, w_icon, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
+                        with st.expander("🌍 Impact of 1,000 prompts"):
+                            st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
+                            st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{km:.1f}** km driven\n- {w_icon} **{w_val:.1f}** {w_unit}")
+                            
+                st.write("")
+                st.markdown("### 🚨 Most Resource Intensive Models (Heavy Footprint)")
+                w_cols = st.columns(len(worst))
+                for idx, row in enumerate(worst.itertuples()):
+                    with w_cols[idx]:
+                        st.markdown(
+                            f'<div class="metric-card-danger"><h4>{row.Join_Key.upper()}</h4>'
+                            f'<h2>{format_number(row.Energy_Intensity_Wh_tx)} Wh/tx</h2>'
+                            f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
+                            unsafe_allow_html=True
+                        )
+                        # Real world equivalent per 1000 requests
+                        phones, km, w_val, w_unit, w_icon, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
+                        with st.expander("🌍 Impact of 1,000 prompts"):
+                            st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
+                            st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{km:.1f}** km driven\n- {w_icon} **{w_val:.1f}** {w_unit}")
+                st.divider()
+                
+                # FULL RANKING TABLE WITH PROGRESS BARS
+                with st.expander("📊 View Full AI Models Ranking (Best to Worst)", expanded=False):
+                    st.caption("All tested AI models sorted by architectural energy intensity (Wh per standard 1K-token transaction).")
+                    
+                    max_e = model_stats['Energy_Intensity_Wh_tx'].max()
+                    max_w = model_stats['Water_Intensity_ml_tx'].max()
+                    
+                    st.dataframe(
+                        model_stats[['Join_Key', 'Energy_Intensity_Wh_tx', 'Water_Intensity_ml_tx']],
+                        column_config={
+                            "Join_Key": "Model Name",
+                            "Energy_Intensity_Wh_tx": st.column_config.ProgressColumn(
+                                "Energy Intensity (Wh/tx)", 
+                                format="%.4f Wh", 
+                                min_value=0, 
+                                max_value=max_e
+                            ),
+                            "Water_Intensity_ml_tx": st.column_config.ProgressColumn(
+                                "Water Intensity (ml/tx)", 
+                                format="%.4f ml", 
+                                min_value=0, 
+                                max_value=max_w
+                            )
+                        },
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                st.markdown("### 🎯 Actionable Recommendations")
+                st.success("**Recommendation:** Whenever possible, fallback to smaller, purpose-built models like **Claude 3.5 Haiku** or **GPT-4o-mini** instead of their heavier counterparts (Sonnet/Opus/GPT-4) for summarization, RAG, or routing tasks. These lightweight models are heavily optimized by hyperscalers, typically operating up to **4x more energy-efficiently** and evaporating up to **80% less direct water** per prompt. Only default to high-intensity models for complex reasoning or highly creative tasks.")
+
+                st.write("")
+                with st.expander("🌐 Global Benchmark Context (EcoLogits & ML. ENERGY)"):
+                    st.markdown("""
+                    **How does our internal data compare to global standards?**
+                    Our backend telemetry leverages EcoLogits, which aligns its architectural energy baselines with the [ML. ENERGY Leaderboard](https://ml.energy/leaderboard/). While the global leaderboard ranks models based on standardized, isolated tests, the results in this dashboard reflect our **actual, real-world enterprise usage**.
+                    
+                    **Example: Claude 3.5 Haiku (1,000 Prompts)**
+                    
+                    | Metric | Global Benchmark (Isolated) | Our Dashboard (Real-World) | Why the difference? |
+                    | :--- | :--- | :--- | :--- |
+                    | **Energy** | ~150 Wh | **430 Wh** | We include infrastructure overhead, RAG payloads, and network routing. |
+                    | **Water** | ~20 ml | **81 ml** | Global metrics assume perfect liquid cooling; we measure our specific cloud region's WUE. |
+                    | **Carbon** | ~60 gCO₂e | **128 gCO₂e** | We factor in hardware Embodied Carbon (M) and the actual local grid fossil-fuel intensity. |
+                    
+                    You may notice variations between our internal ranking and public benchmarks due to:
+                    * **Context Windows (RAG):** Heavy use of Retrieval-Augmented Generation inflates the token payload per transaction compared to short benchmark queries.
+                    * **Infrastructure Geography:** Global benchmarks use average grid intensities. Our carbon footprint directly reflects the local grid where the container runs (e.g., AWS `ap-south-1`).
+                    * **Embodied Carbon Allocation:** We strictly allocate the physical hardware's manufacturing footprint into our SCI metrics, whereas many public leaderboards only track operational electricity.
+                    """)
+
+if __name__ == "__main__":
+        render_app()
