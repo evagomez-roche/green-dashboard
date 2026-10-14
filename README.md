@@ -158,7 +158,7 @@ The SDK now automatically tracks `SDK_VERSION` and `MEASUREMENT_METHOD` to ensur
 
 After your code finishes executing, the SDK will automatically generate a file named `green_telemetry.db` (or your custom `db_path`) in your project folder. This file stores all your telemetry data locally.
 
-**Next Step:** Move this `.db` file to the `incoming_dbs/` directory and run `merge_dbs.py`. Your data will be instantly consolidated and visualized on the central SCI Dashboard (`app.py`).
+**Next Step:** Send this `.db` file to the Digital Sustainability Team. Your data will be then consolidated and visualized on the central SCI Dashboard (`app.py`).
 
 ## 6. ⚖️ Measuring Optimizations (Pre vs. Post & The Own Mirror)
 
