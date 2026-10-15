@@ -101,6 +101,14 @@ def format_number(val):
             return f"{val:,.2f}"
     return val
 
+def format_carbon(val):
+    if pd.isna(val):
+        return "0 gCO₂e"
+    if val >= 1000:
+        return f"{val / 1000:,.2f} kgCO₂e"
+    else:
+        return f"{val:,.2f} gCO₂e"
+
 def format_dataframe_display(df):
     df_display = df.copy()
     for col in df_display.columns:
@@ -309,7 +317,7 @@ def process_dataframe(df):
     df = df.rename(columns={
         'SCI_TRACKER_ID': 'SCI Tracker ID',
         'EXECUTION_DATE': 'Date',
-        'SCI_SCORE_GCO2E_TX': 'SCI Score (g CO2e/tx)',
+        'SCI_SCORE_GCO2E_TX': 'SCI Score (g CO2e/tx)', # Keep for raw data view
         'TOTAL_CARBON_FOOTPRINT_GCO2E': 'Total Carbon Footprint (g CO2e)',
         'ENERGY_CONSUMED_KWH': 'Energy Consumed - E (kWh)',
         'EMBODIED_EMISSIONS_GCO2E': 'Embodied Emissions - M (g CO2e)',
@@ -352,7 +360,7 @@ def render_app():
     st.title("🌱 SCITracker: Software Carbon Intensity Dashboard")
     st.caption("Green Software Foundation Telemetry & Real-Time Analytics")
 
-    df, source = load_data()
+    df_raw, source = load_data()
 
     # =====================================================================
     # SIDEBAR CONTROLS & FILTERS
@@ -366,12 +374,29 @@ def render_app():
         st.cache_data.clear()
         st.rerun()
 
-    if source == "EMPTY" or (df is not None and df.empty):
+    if source == "EMPTY" or (df_raw is not None and df_raw.empty):
         st.info("ℹ️ Telemetry database is currently empty. Run your test script to populate 'green_telemetry.db'.")
         st.stop()
-    elif df is None:
+    elif df_raw is None:
         st.error(f"❌ Database connection error: {source}")
         st.stop()
+
+    st.sidebar.divider()
+    
+    # 1. VERSION ISOLATION (Apples to Apples)
+    available_versions = sorted(df_raw['SDK_VERSION'].dropna().unique(), reverse=True)
+    selected_version = st.sidebar.selectbox(
+        "🛡️ SDK Context (Prevents Math Mixing)",
+        options=available_versions + ["All (Not Recommended)"],
+        index=0,
+        help="To maintain mathematical integrity (Apples to Apples), the dashboard filters out legacy data and only displays the latest SDK methodology by default."
+    )
+    
+    if selected_version != "All (Not Recommended)":
+        df = df_raw[df_raw['SDK_VERSION'] == selected_version].copy()
+    else:
+        df = df_raw.copy()
+        st.sidebar.warning("⚠️ Mixing SDK versions aggregates different math models (e.g., CodeCarbon v1 vs CLEER v2).")
 
     st.sidebar.divider()
     st.sidebar.header("Filter Telemetry")
@@ -391,11 +416,12 @@ def render_app():
     # =====================================================================
     # TABS SETUP
     # =====================================================================
-    tab_drilldown, tab_global, tab_water, tab_insights = st.tabs([
+    tab_drilldown, tab_global, tab_water, tab_insights, tab_simulator = st.tabs([
         "🔍 Project Drill-down",
         "🌍 Global Overview", 
         "💧 Water Footprint",
-        "💡 AI Models Benchmark"
+        "💡 AI Models Benchmark",
+        "🧮 GreenOps Simulator"
     ])
 
     # =====================================================================
@@ -415,10 +441,9 @@ def render_app():
             has_api_failure = any("ecologits_unavailable" in str(m).lower() for m in problematic_methods)
             has_incomplete = any("incomplete_run" in str(m).lower() for m in problematic_methods)
             
-            # FIX: Display SDK version for transparency
             project_versions = df_proj['SDK_VERSION'].dropna().unique()
             versions_str = ", ".join(project_versions) if len(project_versions) > 0 else "v1.0.0"
-            st.caption(f"**SDK Version Detected:** `{versions_str}`")
+            st.caption(f"**SDK Version Context:** `{versions_str}`")
             
             if has_tdp_fallback or has_api_failure or has_incomplete:
                 st.error("⚠️ **Data Quality Warning:** Some telemetry data in this project may not be 100% accurate.")
@@ -426,7 +451,7 @@ def render_app():
                 if has_tdp_fallback:
                     warning_msgs.append("- **TDP Fallback:** CodeCarbon could not read physical CPU sensors (likely running in a container) and estimated energy based on the whole machine's max TDP. This typically **overestimates** the footprint.")
                 if has_api_failure:
-                    warning_msgs.append("- **API Failure:** EcoLogits remote API was unavailable or rejected the model request during execution. The remote AI footprint was recorded as 0.0, **underestimating** the real impact.")
+                    warning_msgs.append("- **API Failure:** Remote API was unavailable or rejected the model request during execution. The footprint was recorded as 0.0, **underestimating** the real impact.")
                 if has_incomplete:
                     warning_msgs.append("- **Incomplete Execution:** Some steps crashed or were killed before finishing. The recorded data only represents a partial run.")
                 for msg in warning_msgs:
@@ -481,6 +506,16 @@ def render_app():
                             if pd.notna(row['AI_MODEL_NAME']):
                                 df_proj.at[idx, 'AI_MODEL_NAME'] = f"{row['AI_MODEL_NAME']}{suffix}"
 
+            # 2. WEIGHTED AVERAGE SCI CALCULATION
+            proj_total_carbon = df_proj['Total Carbon Footprint (g CO2e)'].sum()
+            proj_total_energy = df_proj['Energy Consumed - E (kWh)'].sum()
+            proj_total_tx = df_proj['Functional Unit - R (Transactions)'].sum()
+            
+            if proj_total_tx > 0:
+                proj_avg_sci = proj_total_carbon / proj_total_tx
+            else:
+                proj_avg_sci = 0.0
+
             with st.expander("📊 View Component Comparison Chart", expanded=False):
                 proj_metric = st.selectbox(
                     "Select metric to compare across components:", 
@@ -490,7 +525,12 @@ def render_app():
                 group_col_compare = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
                 
                 if "SCI" in proj_metric:
-                    compare_df = df_proj.groupby(group_col_compare)[proj_metric].mean().reset_index()
+                    # Fix to weighted average for chart
+                    compare_df = df_proj.groupby(group_col_compare).agg({
+                        'Total Carbon Footprint (g CO2e)': 'sum',
+                        'Functional Unit - R (Transactions)': 'sum'
+                    }).reset_index()
+                    compare_df[proj_metric] = np.where(compare_df['Functional Unit - R (Transactions)'] > 0, compare_df['Total Carbon Footprint (g CO2e)'] / compare_df['Functional Unit - R (Transactions)'], 0)
                 else:
                     compare_df = df_proj.groupby(group_col_compare)[proj_metric].sum().reset_index()
                     
@@ -523,10 +563,6 @@ def render_app():
             st.subheader(f"📈 Key Impact Metrics (KPIs): {selected_proj_drill}")
             pm1, pm2, pm3, pm4 = st.columns(4)
             
-            proj_total_carbon = df_proj['Total Carbon Footprint (g CO2e)'].sum()
-            proj_avg_sci = df_proj['SCI Score (g CO2e/tx)'].mean()
-            proj_total_energy = df_proj['Energy Consumed - E (kWh)'].sum()
-            
             if not df_proj.empty:
                 hotspot_idx = df_proj['Total Carbon Footprint (g CO2e)'].idxmax()
                 proj_hotspot = df_proj.loc[hotspot_idx]['PROCESS_DESC'] if not is_ai_proj else df_proj.loc[hotspot_idx]['AI_MODEL_NAME']
@@ -534,13 +570,14 @@ def render_app():
                 proj_hotspot = "N/A"
                 
             with pm1:
-                st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(proj_total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_carbon(proj_total_carbon)}</h2></div>', unsafe_allow_html=True)
             with pm2:
                 st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(proj_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
             with pm3:
                 st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(proj_total_energy)} kWh</h2></div>', unsafe_allow_html=True)
             with pm4:
-                st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.2rem !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
+                # FIX: Text truncation on Hotspot
+                st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.1rem !important; overflow-wrap: break-word; white-space: normal; line-height: 1.3;">{proj_hotspot}</h2></div>', unsafe_allow_html=True)
             
             # Integrate Project-Level Water KPIs here
             st.write("")
@@ -549,7 +586,8 @@ def render_app():
             df_proj_w['Water_Consumed_Liters'] = df_proj_w['Energy Consumed - E (kWh)'] * df_proj_w['WUE (L/kWh)']
             proj_total_water = df_proj_w['Water_Consumed_Liters'].sum()
             df_proj_w['Water_Intensity_ml_tx'] = (df_proj_w['Water_Consumed_Liters'] * 1000) / df_proj_w['Functional Unit - R (Transactions)'].replace(0, 1)
-            proj_avg_water_int = df_proj_w['Water_Intensity_ml_tx'].mean()
+            # Weighted average for water
+            proj_avg_water_int = (proj_total_water * 1000) / proj_total_tx if proj_total_tx > 0 else 0
             
             pw1, pw2 = st.columns(2)
             with pw1:
@@ -565,27 +603,46 @@ def render_app():
                 st.subheader("🚀 Green SDK v2.0: CLEER Methodology & GSF Caching")
                 st.markdown("This section analyzes the environmental savings achieved by **Semantic/Prompt Caching** evaluated through the deterministic CLEER math model.")
                 
-                cleer_df = df_proj[df_proj['SDK_VERSION'] == 'v2.0.0']
-                total_cache_tokens = cleer_df['CACHED_TOKENS'].sum()
+                # FIX: Educational Demystification Block
+                st.info(
+                    "**Demystifying the Metrics:**\n"
+                    "- **Baseline SCI (Unoptimized):** What your footprint *would be* if the GPU had to process every single token from scratch.\n"
+                    "- **CLEER SCI (Cache-Aware):** Your *actual* footprint. It applies a mathematical discount for tokens served directly from the provider's memory.\n"
+                    "- **Note:** The *'SCI Score'* you see in the top KPIs and the Telemetry Registry is the final **CLEER SCI**. We show the Baseline here purely to prove your FinOps and GreenOps savings."
+                )
                 
-                if total_cache_tokens > 0:
+                cleer_df = df_proj[df_proj['SDK_VERSION'] == 'v2.0.0'].copy()
+                total_cache_tokens = cleer_df['CACHED_TOKENS'].sum()
+                cleer_total_tx = cleer_df['Functional Unit - R (Transactions)'].sum()
+                
+                if total_cache_tokens > 0 and cleer_total_tx > 0:
                     c1, c2, c3 = st.columns(3)
-                    avg_baseline = cleer_df['BASELINE_SCI_GCO2E'].mean()
-                    avg_cleer = cleer_df['CLEER_SCI_GCO2E'].mean()
                     
-                    # Yield calculation for display (higher yield is better)
+                    # Weighted math for CLEER comparison
+                    cleer_df['Total_Baseline_Carbon'] = cleer_df['BASELINE_SCI_GCO2E'] * cleer_df['Functional Unit - R (Transactions)']
+                    avg_baseline = cleer_df['Total_Baseline_Carbon'].sum() / cleer_total_tx
+                    avg_cleer = cleer_df['Total Carbon Footprint (g CO2e)'].sum() / cleer_total_tx
+                    
+                    # Yield calculation for display
                     avg_yield = ((avg_baseline - avg_cleer) / avg_baseline) * 100 if avg_baseline > 0 else 0
                     
-                    c1.metric(label="Baseline (Unoptimized) SCI", value=f"{avg_baseline:.2f} g/tx")
+                    c1.metric(label="Baseline SCI (If no cache was used)", value=f"{avg_baseline:.2f} g/tx")
                     # Normal color makes positive values green
-                    c2.metric(label="CLEER (Cache-Aware) SCI", value=f"{avg_cleer:.2f} g/tx", delta=f"{avg_yield:.1f}% Yield", delta_color="normal")
+                    c2.metric(label="CLEER SCI (Actual Final Score)", value=f"{avg_cleer:.2f} g/tx", delta=f"{avg_yield:.1f}% Yield", delta_color="normal")
                     c3.metric(label="Tokens Served From Cache", value=f"{format_number(total_cache_tokens)}")
                     
                     # Chart Baseline vs CLEER
-                    cleer_chart_df = cleer_df.groupby('AI_MODEL_NAME')[['BASELINE_SCI_GCO2E', 'CLEER_SCI_GCO2E']].mean().reset_index()
+                    cleer_chart_df = cleer_df.groupby('AI_MODEL_NAME').agg({
+                        'Total_Baseline_Carbon': 'sum',
+                        'Total Carbon Footprint (g CO2e)': 'sum',
+                        'Functional Unit - R (Transactions)': 'sum'
+                    }).reset_index()
+                    cleer_chart_df['BASELINE_SCI_GCO2E'] = cleer_chart_df['Total_Baseline_Carbon'] / cleer_chart_df['Functional Unit - R (Transactions)']
+                    cleer_chart_df['CLEER_SCI_GCO2E'] = cleer_chart_df['Total Carbon Footprint (g CO2e)'] / cleer_chart_df['Functional Unit - R (Transactions)']
+
                     fig_cleer = go.Figure()
-                    fig_cleer.add_trace(go.Bar(name='Baseline SCI (Unoptimized)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['BASELINE_SCI_GCO2E'], marker_color='#e74c3c'))
-                    fig_cleer.add_trace(go.Bar(name='CLEER SCI (Cache-Aware)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['CLEER_SCI_GCO2E'], marker_color='#2ecc71'))
+                    fig_cleer.add_trace(go.Bar(name='Theoretical Baseline (No Cache)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['BASELINE_SCI_GCO2E'], marker_color='#e74c3c'))
+                    fig_cleer.add_trace(go.Bar(name='Actual CLEER SCI (With Cache)', x=cleer_chart_df['AI_MODEL_NAME'], y=cleer_chart_df['CLEER_SCI_GCO2E'], marker_color='#2ecc71'))
                     fig_cleer.update_layout(barmode='group', title="Methodology Comparison per Model")
                     st.plotly_chart(fig_cleer, use_container_width=True)
                 else:
@@ -594,6 +651,9 @@ def render_app():
             # =====================================================================
             # PRE VS POST OPTIMIZATION SAVINGS MODULE
             # =====================================================================
+            df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
+            df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
+            
             if df_proj['Is_Post'].any():
                 st.divider()
                 st.subheader("📉 Optimization Trajectory & Savings (Pre vs Post)")
@@ -613,6 +673,9 @@ def render_app():
                     
                     pre_carbon_total = df_pre['Total Carbon Footprint (g CO2e)'].sum()
                     post_carbon_total = df_post['Total Carbon Footprint (g CO2e)'].sum()
+                    
+                    pre_tx_total = df_pre['Functional Unit - R (Transactions)'].sum()
+                    post_tx_total = df_post['Functional Unit - R (Transactions)'].sum()
                     
                     compare_data = pd.DataFrame({
                         'Phase': ['Baseline', 'Post-Optimization'],
@@ -651,8 +714,8 @@ def render_app():
                     carbon_saved = pre_carbon_total - post_carbon_total
                     carbon_pct = (carbon_saved / pre_carbon_total * 100) if pre_carbon_total > 0 else 0
                     
-                    pre_sci_avg = df_pre['SCI Score (g CO2e/tx)'].mean()
-                    post_sci_avg = df_post['SCI Score (g CO2e/tx)'].mean()
+                    pre_sci_avg = pre_carbon_total / pre_tx_total if pre_tx_total > 0 else 0
+                    post_sci_avg = post_carbon_total / post_tx_total if post_tx_total > 0 else 0
                     sci_saved = pre_sci_avg - post_sci_avg
                     sci_pct = (sci_saved / pre_sci_avg * 100) if pre_sci_avg > 0 else 0
                     
@@ -661,12 +724,12 @@ def render_app():
                         cost_pct = (cost_saved / pre_cost_total * 100) if pre_cost_total > 0 else 0
                         
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("Total Carbon Reduction", f"{format_number(carbon_saved)} gCO₂e", f"{format_number(-carbon_pct)}%", delta_color="inverse")
+                        m1.metric("Total Carbon Reduction", f"{format_carbon(carbon_saved)}", f"{format_number(-carbon_pct)}%", delta_color="inverse")
                         m2.metric("SCI Reduction", f"{format_number(sci_saved)} g/tx", f"{format_number(-sci_pct)}%", delta_color="inverse")
                         m3.metric("Total FinOps Savings", f"${format_number(cost_saved)}", f"{format_number(-cost_pct)}%", delta_color="inverse")
                     else:
                         m1, m2 = st.columns(2)
-                        m1.metric("Total Carbon Reduction", f"{format_number(carbon_saved)} gCO₂e", f"{format_number(-carbon_pct)}%", delta_color="inverse")
+                        m1.metric("Total Carbon Reduction", f"{format_carbon(carbon_saved)}", f"{format_number(-carbon_pct)}%", delta_color="inverse")
                         m2.metric("SCI Reduction", f"{format_number(sci_saved)} g/tx", f"{format_number(-sci_pct)}%", delta_color="inverse")
                     
                     st.divider()
@@ -679,8 +742,11 @@ def render_app():
                         saved_c = pre_c - post_c
                         pct_c = (saved_c / pre_c * 100) if pre_c > 0 else 0
                         
-                        pre_sci = df_pre[df_pre['Clean_Step'] == step]['SCI Score (g CO2e/tx)'].mean()
-                        post_sci = df_post[df_post['Clean_Step'] == step]['SCI Score (g CO2e/tx)'].mean()
+                        pre_tx = df_pre[df_pre['Clean_Step'] == step]['Functional Unit - R (Transactions)'].sum()
+                        post_tx = df_post[df_post['Clean_Step'] == step]['Functional Unit - R (Transactions)'].sum()
+                        
+                        pre_sci = pre_c / pre_tx if pre_tx > 0 else 0
+                        post_sci = post_c / post_tx if post_tx > 0 else 0
                         saved_sci = pre_sci - post_sci
                         pct_sci = (saved_sci / pre_sci * 100) if pre_sci > 0 else 0
 
@@ -698,30 +764,33 @@ def render_app():
                                     step_cost_saved = step_pre_cost - step_post_cost
                                     step_cost_pct = (step_cost_saved / step_pre_cost * 100) if step_pre_cost > 0 else 0
                                     
-                                    st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
+                                    st.metric("Carbon Reduction", f"{format_carbon(metrics['saved'])}", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
                                     st.metric("FinOps Savings", f"${format_number(step_cost_saved)}", f"{format_number(-step_cost_pct)}%", delta_color="inverse")
                                 else:
-                                    st.metric("Carbon Reduction", f"{format_number(metrics['saved'])} gCO₂e", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
+                                    st.metric("Carbon Reduction", f"{format_carbon(metrics['saved'])}", f"{format_number(-metrics['pct'])}%", delta_color="inverse")
                         col_idx += 1
 
             st.write("")
             st.divider()
             st.markdown("### 📊 Benchmark & Real-World Context")
             
-            project_avg_scis = filtered_df.groupby('Project')['SCI Score (g CO2e/tx)'].mean()
-            global_sci_stats = project_avg_scis.describe()
+            # Global Medians for contextualization
+            project_totals_bench = filtered_df.groupby('Project').agg({
+                'Total Carbon Footprint (g CO2e)': 'sum',
+                'Functional Unit - R (Transactions)': 'sum'
+            })
+            project_avg_scis = project_totals_bench['Total Carbon Footprint (g CO2e)'] / project_totals_bench['Functional Unit - R (Transactions)']
             global_median_sci = project_avg_scis.median()
+            global_median_carbon = project_totals_bench['Total Carbon Footprint (g CO2e)'].median()
             
             col_bench1, col_bench2 = st.columns(2)
-            project_totals = filtered_df.groupby('Project')['Total Carbon Footprint (g CO2e)'].sum()
-            global_median_carbon = project_totals.median()
             with col_bench1:
                 st.markdown("**1. Absolute Environmental Impact (Total Carbon)**")
                 if pd.notna(proj_total_carbon) and pd.notna(global_median_carbon):
                     if proj_total_carbon > global_median_carbon:
-                        st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **higher** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
+                        st.warning(f"⚠️ **High Volume:** This project's total cumulative carbon ({format_carbon(proj_total_carbon)}) is **higher** than the global project median ({format_carbon(global_median_carbon)}).")
                     else:
-                        st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_number(proj_total_carbon)} gCO₂e) is **lower** than the global project median ({format_number(global_median_carbon)} gCO₂e).")
+                        st.success(f"🌱 **Low Volume:** This project's total cumulative carbon ({format_carbon(proj_total_carbon)}) is **lower** than the global project median ({format_carbon(global_median_carbon)}).")
             
             with col_bench2:
                 st.markdown("**2. Software Code Efficiency (Average SCI)**")
@@ -790,22 +859,22 @@ def render_app():
                     )
                 else:
                     if proj_total_carbon < 8.0:
-                        st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
+                        st.info(f"💡 **Energy Context (Standard Code):** The {format_carbon(proj_total_carbon)} emitted is so minimal that it's not even enough to fully charge a single smartphone (which takes ~8g CO₂e).")
                     else:
                         smartphones = int(proj_total_carbon / 8.0)
                         km_driven = proj_total_carbon / 192.0
                         
                         if km_driven < 1:
-                            st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
+                            st.info(f"💡 **Energy Context (Standard Code):** The {format_carbon(proj_total_carbon)} emitted by this standard software project is equivalent to charging **{smartphones} smartphones** (less than 1 km of driving a gas car).")
                         else:
-                            st.info(f"💡 **Energy Context (Standard Code):** The {format_number(proj_total_carbon)} gCO₂e emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**.")
+                            st.info(f"💡 **Energy Context (Standard Code):** The {format_carbon(proj_total_carbon)} emitted by this standard software project is equivalent to the carbon footprint of driving a gasoline car for **{format_number(km_driven)} km** or charging **{smartphones} smartphones**.")
                     
                 uk_annual_carbon_g = 7000000.0 # 7 tonnes
                 pct_of_uk_citizen = (proj_total_carbon / uk_annual_carbon_g) * 100
                 
                 st.info(
                     f"💡 **Carbon Context:** The average UK citizen emits 7 tonnes of CO₂ annually from energy and industry. "
-                    f"This project's total footprint ({format_number(proj_total_carbon)} gCO₂e) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
+                    f"This project's total footprint ({format_carbon(proj_total_carbon)}) represents **{format_uk_pct(pct_of_uk_citizen)}** of that annual footprint."
                 )
             else:
                 st.info("💡 **Context:** The recorded energy and carbon totals for this timeframe are currently **0**. Process more data to see real-world equivalents.")
@@ -829,23 +898,30 @@ def render_app():
                     "Consequently, its energy consumption per token (Wh/token) provides the most mathematically accurate baseline available to estimate the carbon emissions of a next-generation Opus model."
                 )
 
-            df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
-            df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
-            
             group_col_table = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
+            
+            # Weighted average for Breakdown Table
             breakdown_table = df_proj.groupby(group_col_table).agg({
-                'SCI Score (g CO2e/tx)': 'mean',
+                'Total Carbon Footprint (g CO2e)': 'sum',
+                'Functional Unit - R (Transactions)': 'sum',
                 'Energy Consumed - E (kWh)': 'sum', 
-                'Total Carbon Footprint (g CO2e)': 'sum', 
                 'Estimated_Cost_$': 'sum',
                 'MEASUREMENT_PERIOD': 'first'
             }).reset_index()
+            
+            breakdown_table['SCI Score (g CO2e/tx)'] = np.where(
+                breakdown_table['Functional Unit - R (Transactions)'] > 0,
+                breakdown_table['Total Carbon Footprint (g CO2e)'] / breakdown_table['Functional Unit - R (Transactions)'],
+                0.0
+            )
             
             breakdown_table = breakdown_table.rename(columns={
                 group_col_table: 'Component / Step', 
                 'SCI Score (g CO2e/tx)': 'Average SCI Score (g CO2e/tx)',
                 'MEASUREMENT_PERIOD': 'Original Period'
             })
+            
+            breakdown_table = breakdown_table.drop(columns=['Functional Unit - R (Transactions)'])
             
             formatted_breakdown = format_dataframe_display(breakdown_table)
             if 'Estimated_Cost_$' in formatted_breakdown.columns:
@@ -861,11 +937,18 @@ def render_app():
             
             group_col_chart = 'AI_MODEL_NAME' if is_ai_proj else 'PROCESS_DESC'
             
+            # Weighted average for Charts
             breakdown_chart = chart_df.groupby(group_col_chart).agg({
                 'Total Carbon Footprint (g CO2e)': 'sum',
-                'Estimated_Cost_$': 'sum',
-                'SCI Score (g CO2e/tx)': 'mean'
+                'Functional Unit - R (Transactions)': 'sum',
+                'Estimated_Cost_$': 'sum'
             }).reset_index().rename(columns={group_col_chart: 'Component / Step'})
+
+            breakdown_chart['SCI Score (g CO2e/tx)'] = np.where(
+                breakdown_chart['Functional Unit - R (Transactions)'] > 0,
+                breakdown_chart['Total Carbon Footprint (g CO2e)'] / breakdown_chart['Functional Unit - R (Transactions)'],
+                0.0
+            )
 
             num_items = len(breakdown_chart)
             is_horizontal = num_items >= 8
@@ -968,21 +1051,23 @@ def render_app():
 
         st.subheader(f"📈 Key Impact Metrics ({target_scale_global})")
         m1, m2, m3, m4 = st.columns(4)
-        total_carbon = df_global_scaled['Total Carbon Footprint (g CO2e)'].sum()
-        avg_sci = df_global_scaled['SCI Score (g CO2e/tx)'].mean()
-        total_energy = df_global_scaled['Energy Consumed - E (kWh)'].sum()
         
-        max_su_idx = df_global_scaled['SCI Score (g CO2e/tx)'].idxmax()
+        total_carbon = df_global_scaled['Total Carbon Footprint (g CO2e)'].sum()
+        total_energy = df_global_scaled['Energy Consumed - E (kWh)'].sum()
+        total_tx = df_global_scaled['Functional Unit - R (Transactions)'].sum()
+        avg_sci = total_carbon / total_tx if total_tx > 0 else 0
+        
+        max_su_idx = df_global_scaled['Total Carbon Footprint (g CO2e)'].idxmax() if not df_global_scaled.empty else None
         max_su = df_global_scaled.loc[max_su_idx]['SCI Tracker ID'] if pd.notna(max_su_idx) else "N/A"
         
         with m1:
-            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_number(total_carbon)} gCO₂e</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><h4>Total Carbon Footprint</h4><h2>{format_carbon(total_carbon)}</h2></div>', unsafe_allow_html=True)
         with m2:
             st.markdown(f'<div class="metric-card"><h4>Average SCI Score</h4><h2>{format_number(avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
         with m3:
             st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(total_energy)} kWh</h2></div>', unsafe_allow_html=True)
         with m4:
-            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su}</h2></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.1rem !important; overflow-wrap: break-word; white-space: normal; line-height: 1.3;">{max_su}</h2></div>', unsafe_allow_html=True)
 
         st.divider()
         
@@ -1030,8 +1115,12 @@ def render_app():
         ])
         fig_stack.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
         
-        global_avg_sci = df_tab1['SCI Score (g CO2e/tx)'].mean()
-        if pd.notna(global_avg_sci):
+        # Weighted global sci for the chart h-line
+        global_carbon_tab1 = df_tab1['Total Carbon Footprint (g CO2e)'].sum()
+        global_tx_tab1 = df_tab1['Functional Unit - R (Transactions)'].sum()
+        global_avg_sci = global_carbon_tab1 / global_tx_tab1 if global_tx_tab1 > 0 else 0
+        
+        if pd.notna(global_avg_sci) and global_avg_sci > 0:
             fig_stack.add_hline(y=global_avg_sci, line_dash="dash", line_color="gray", 
                                 annotation_text=f"Global Avg SCI: {global_avg_sci:.2f}", 
                                 annotation_position="top left")
@@ -1063,16 +1152,21 @@ def render_app():
 
                 st.subheader("📈 Standard Code KPIs")
                 s1, s2, s3, s4 = st.columns(4)
+                
+                std_carbon = df_tab2["Total Carbon Footprint (g CO2e)"].sum()
+                std_tx = df_tab2["Functional Unit - R (Transactions)"].sum()
+                std_avg_sci = std_carbon / std_tx if std_tx > 0 else 0
+                
                 with s1:
-                    st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_number(df_tab2["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card"><h4>Total Carbon</h4><h2>{format_carbon(std_carbon)}</h2></div>', unsafe_allow_html=True)
                 with s2:
-                    st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_number(df_tab2["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card"><h4>Average SCI</h4><h2>{format_number(std_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
                 with s3:
                     st.markdown(f'<div class="metric-card"><h4>Energy Consumed</h4><h2>{format_number(df_tab2["Energy Consumed - E (kWh)"].sum())} kWh</h2></div>', unsafe_allow_html=True)
                 with s4:
-                    max_su_idx_std = df_tab2['SCI Score (g CO2e/tx)'].idxmax() if not df_tab2.empty else None
+                    max_su_idx_std = df_tab2['Total Carbon Footprint (g CO2e)'].idxmax() if not df_tab2.empty else None
                     max_su_std = df_tab2.loc[max_su_idx_std]['SCI Tracker ID'] if pd.notna(max_su_idx_std) else "N/A"
-                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_std}</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.1rem !important; overflow-wrap: break-word; white-space: normal; line-height: 1.3;">{max_su_std}</h2></div>', unsafe_allow_html=True)
                 
                 st.divider()
                 st.subheader("📊 Standard Projects Overview")
@@ -1096,8 +1190,7 @@ def render_app():
                         go.Bar(name='Embodied', x=df_std_grp['Project'], y=df_std_grp['Embodied_gCO2e_tx'], marker_color='#e74c3c')
                     ])
                     fig_stack_std.update_layout(barmode='stack', yaxis_title='gCO₂e / transaction')
-                    std_avg_sci = df_tab2['SCI Score (g CO2e/tx)'].mean()
-                    if pd.notna(std_avg_sci):
+                    if pd.notna(std_avg_sci) and std_avg_sci > 0:
                         fig_stack_std.add_hline(y=std_avg_sci, line_dash="dash", line_color="gray", 
                                                 annotation_text=f"Std Avg SCI: {std_avg_sci:.2f}", 
                                                 annotation_position="top left")
@@ -1137,16 +1230,21 @@ def render_app():
 
                 st.subheader("📈 AI Code KPIs")
                 a1, a2, a3, a4 = st.columns(4)
+                
+                ai_carbon = df_tab3["Total Carbon Footprint (g CO2e)"].sum()
+                ai_tx = df_tab3["Functional Unit - R (Transactions)"].sum()
+                ai_avg_sci = ai_carbon / ai_tx if ai_tx > 0 else 0
+                
                 with a1:
-                    st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_number(df_tab3["Total Carbon Footprint (g CO2e)"].sum())} gCO₂e</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card"><h4>Total AI Carbon</h4><h2>{format_carbon(ai_carbon)}</h2></div>', unsafe_allow_html=True)
                 with a2:
-                    st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_number(df_tab3["SCI Score (g CO2e/tx)"].mean())} g/tx</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card"><h4>Average AI SCI</h4><h2>{format_number(ai_avg_sci)} g/tx</h2></div>', unsafe_allow_html=True)
                 with a3:
                     st.markdown(f'<div class="metric-card"><h4>Total Tokens</h4><h2>{df_tab3["Total_Tokens"].sum():,.0f}</h2></div>', unsafe_allow_html=True)
                 with a4:
-                    max_ai_idx = df_tab3['SCI Score (g CO2e/tx)'].idxmax() if not df_tab3.empty else None
+                    max_ai_idx = df_tab3['Total Carbon Footprint (g CO2e)'].idxmax() if not df_tab3.empty else None
                     max_su_ai = df_tab3.loc[max_ai_idx]['SCI Tracker ID'] if pd.notna(max_ai_idx) else "N/A"
-                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2>{max_su_ai}</h2></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="metric-card-danger"><h4>Highest Hotspot</h4><h2 style="font-size: 1.1rem !important; overflow-wrap: break-word; white-space: normal; line-height: 1.3;">{max_su_ai}</h2></div>', unsafe_allow_html=True)
 
                 st.divider()
                 st.subheader("📊 AI Analytics & Financial FinOps")
@@ -1166,7 +1264,6 @@ def render_app():
                 fig_cost_proj = px.bar(cost_agg_proj, x='Project', y='Estimated_Cost_$', title="Financial Cost by Project ($)", color_discrete_sequence=['#3498db'])
                 st.plotly_chart(fig_cost_proj, use_container_width=True)
 
-
     # =====================================================================
     # TAB 3: WATER FOOTPRINT (DIRECT EVAPORATION)
     # =====================================================================
@@ -1179,18 +1276,13 @@ def render_app():
         
         df_water = filtered_df.copy()
         
-        # 1. Map Provider to WUE
         df_water['WUE (L/kWh)'] = df_water['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
-        
-        # 2. Mathematical Formula: Water (Liters) = Energy (kWh) * WUE
         df_water['Water_Consumed_Liters'] = df_water['Energy Consumed - E (kWh)'] * df_water['WUE (L/kWh)']
-        
-        # 3. Water Intensity: (Liters * 1000) / Transactions
         df_water['Water_Intensity_ml_tx'] = (df_water['Water_Consumed_Liters'] * 1000) / df_water['Functional Unit - R (Transactions)'].replace(0, 1)
 
-        # Top-level Metrics
         total_water = df_water['Water_Consumed_Liters'].sum()
-        avg_water_intensity = df_water['Water_Intensity_ml_tx'].mean()
+        water_tx = df_water['Functional Unit - R (Transactions)'].sum()
+        avg_water_intensity = (total_water * 1000) / water_tx if water_tx > 0 else 0
         
         w1, w2 = st.columns(2)
         with w1:
@@ -1200,12 +1292,11 @@ def render_app():
         
         st.divider()
 
-        # --- GLOBAL REAL-WORLD EQUIVALENTS ---
         st.markdown("### 🚰 Global Real-World Equivalents")
         if total_water > 0:
-            glasses = int(total_water / 0.25) # 250ml per glass
-            bathtubs = int(total_water / 150) # 150L per standard bathtub
-            pools = total_water / 2500000     # 2.5M L per Olympic pool
+            glasses = int(total_water / 0.25) 
+            bathtubs = int(total_water / 150) 
+            pools = total_water / 2500000     
             
             if total_water >= 2500000:
                 st.info(f"💡 The total water evaporated across these projects is **{format_number(total_water)} liters**. That is equivalent to completely filling **{format_number(pools)} Olympic-sized swimming pools**.")
@@ -1218,7 +1309,6 @@ def render_app():
 
         st.divider()
 
-        # --- PROJECT DRILL-DOWN (COMPONENT LEVEL) ---
         st.markdown("### 🔍 Project Water Drill-down")
         st.caption("Select a specific project to see how water consumption is distributed across its different models or execution steps.")
         
@@ -1226,7 +1316,6 @@ def render_app():
         df_w_proj = df_water[df_water['Project'] == water_proj].copy()
         
         if not df_w_proj.empty:
-            # --- PROJECT-SPECIFIC REAL-WORLD EQUIVALENT ---
             proj_total_water = df_w_proj['Water_Consumed_Liters'].sum()
             if proj_total_water > 0:
                 p_glasses = int(proj_total_water / 0.25)
@@ -1242,26 +1331,33 @@ def render_app():
             else:
                 st.success(f"💡 No water consumption recorded for project **{water_proj}**.")
 
-            # --- GROUP COMPONENT LOGIC ---
             is_ai_proj_w = df_w_proj['IS_AI'].any()
             group_col_w = 'AI_MODEL_NAME' if is_ai_proj_w else 'PROCESS_DESC'
             
+            # Weighted average for water drill-down chart
             comp_w_df = df_w_proj.groupby(group_col_w).agg({
                 'Water_Consumed_Liters': 'sum',
-                'Water_Intensity_ml_tx': 'mean'
+                'Functional Unit - R (Transactions)': 'sum'
             }).reset_index().rename(columns={group_col_w: 'Component / Step'})
+            
+            comp_w_df['Water_Intensity_ml_tx'] = np.where(
+                comp_w_df['Functional Unit - R (Transactions)'] > 0,
+                (comp_w_df['Water_Consumed_Liters'] * 1000) / comp_w_df['Functional Unit - R (Transactions)'],
+                0
+            )
 
-            # Implement TOP-10 logic for projects with many steps
             comp_w_df = comp_w_df.sort_values('Water_Consumed_Liters', ascending=False)
             num_steps = len(comp_w_df)
 
             if num_steps > 10:
                 top_10 = comp_w_df.head(10)
                 others_water = comp_w_df.iloc[10:]['Water_Consumed_Liters'].sum()
-                others_int = comp_w_df.iloc[10:]['Water_Intensity_ml_tx'].mean()
+                others_tx = comp_w_df.iloc[10:]['Functional Unit - R (Transactions)'].sum()
+                others_int = (others_water * 1000) / others_tx if others_tx > 0 else 0
                 others_row = pd.DataFrame({
                     'Component / Step': [f'Others ({num_steps - 10} steps)'],
                     'Water_Consumed_Liters': [others_water],
+                    'Functional Unit - R (Transactions)': [others_tx],
                     'Water_Intensity_ml_tx': [others_int]
                 })
                 comp_w_df_chart = pd.concat([top_10, others_row], ignore_index=True)
@@ -1270,19 +1366,15 @@ def render_app():
             else:
                 comp_w_df_chart = comp_w_df.copy()
 
-            # --- DYNAMIC CHART LAYOUT ---
             chart_items = len(comp_w_df_chart)
             dynamic_height = max(450, chart_items * 35)
 
             if chart_items > 5:
-                # HORIZONTAL LAYOUT (Stacked vertically)
                 fig_w_tot = px.bar(
                     comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=True), 
                     x='Water_Consumed_Liters', y='Component / Step', 
                     title="Total Absolute Water (Liters)", 
-                    orientation='h',
-                    height=dynamic_height,
-                    color_discrete_sequence=['#3498db']
+                    orientation='h', height=dynamic_height, color_discrete_sequence=['#3498db']
                 )
                 st.plotly_chart(fig_w_tot, use_container_width=True)
                 
@@ -1290,21 +1382,18 @@ def render_app():
                     comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=True), 
                     x='Water_Intensity_ml_tx', y='Component / Step', 
                     title="Water Efficiency (ml per transaction)", 
-                    orientation='h',
-                    height=dynamic_height,
-                    color_discrete_sequence=['#2980b9']
+                    orientation='h', height=dynamic_height, color_discrete_sequence=['#2980b9']
                 )
                 st.plotly_chart(fig_w_int, use_container_width=True)
                 
-            else: # VERTICAL LAYOUT (Side-by-side)
+            else:
                 col_w_chart1, col_w_chart2 = st.columns(2)
                 with col_w_chart1:
                     fig_w_tot = px.bar(
                         comp_w_df_chart.sort_values('Water_Consumed_Liters', ascending=False), 
                         x='Component / Step', y='Water_Consumed_Liters', 
                         title="Total Absolute Water (Liters)", 
-                        orientation='v',
-                        color_discrete_sequence=['#3498db']
+                        orientation='v', color_discrete_sequence=['#3498db']
                     )
                     st.plotly_chart(fig_w_tot, use_container_width=True)
                     
@@ -1313,16 +1402,13 @@ def render_app():
                         comp_w_df_chart.sort_values('Water_Intensity_ml_tx', ascending=False), 
                         x='Component / Step', y='Water_Intensity_ml_tx', 
                         title="Water Efficiency (ml per transaction)", 
-                        orientation='v',
-                        color_discrete_sequence=['#2980b9']
+                        orientation='v', color_discrete_sequence=['#2980b9']
                     )
                     st.plotly_chart(fig_w_int, use_container_width=True)
 
-            # --- AUTOMATED INSIGHTS GENERATOR (APPLES-TO-APPLES) ---
             st.write("")
             st.markdown("#### 💧 Automated Water Efficiency Insights")
             if not comp_w_df.empty and len(comp_w_df) > 1:
-                # Emphasize that intensity (ml/tx) is the true efficiency metric
                 best_idx = comp_w_df['Water_Intensity_ml_tx'].idxmin()
                 worst_idx = comp_w_df['Water_Intensity_ml_tx'].idxmax()
                 
@@ -1343,8 +1429,6 @@ def render_app():
                             f"*Note: A high 'Total Absolute Water' bar just means a component is called frequently, but intensity (ml/tx) reveals its architectural efficiency.*")
 
         st.divider()
-        
-        # --- AI VS STANDARD CONTEXT ---
         st.subheader("⚖️ AI vs Standard Software: Water Intensity")
         with st.expander("Why might AI show lower intensity (ml/tx) despite consuming more total water?"):
             st.markdown("""
@@ -1353,21 +1437,25 @@ def render_app():
             """)
         
         df_water['Workload_Type'] = df_water['IS_AI'].apply(lambda x: "AI Project" if x == 1 else "Standard Software")
-        comp_water_df = df_water.groupby('Workload_Type')['Water_Intensity_ml_tx'].mean().reset_index()
+        comp_water_df = df_water.groupby('Workload_Type').agg({
+            'Water_Consumed_Liters': 'sum',
+            'Functional Unit - R (Transactions)': 'sum'
+        }).reset_index()
+        comp_water_df['Water_Intensity_ml_tx'] = np.where(
+            comp_water_df['Functional Unit - R (Transactions)'] > 0,
+            (comp_water_df['Water_Consumed_Liters'] * 1000) / comp_water_df['Functional Unit - R (Transactions)'],
+            0
+        )
         
         fig_water = px.bar(
             comp_water_df, 
-            x='Workload_Type', 
-            y='Water_Intensity_ml_tx',
-            color='Workload_Type',
+            x='Workload_Type', y='Water_Intensity_ml_tx', color='Workload_Type',
             title="Average Water Consumption per Transaction (ml/tx)",
             labels={'Water_Intensity_ml_tx': 'Water Intensity (ml/tx)', 'Workload_Type': 'Category'},
-            color_discrete_map={'Standard Software': '#2ecc71', 'AI Project': '#8e44ad'},
-            text_auto='.2f'
+            color_discrete_map={'Standard Software': '#2ecc71', 'AI Project': '#8e44ad'}, text_auto='.2f'
         )
         st.plotly_chart(fig_water, use_container_width=True)
 
-        # --- RAW DATA ---
         st.subheader("🗂️ Raw Water Telemetry")
         water_display_cols = ['Project', 'PROCESS_DESC', 'AI_MODEL_NAME', 'PROVIDER', 'WUE (L/kWh)', 'Energy Consumed - E (kWh)', 'Water_Consumed_Liters', 'Water_Intensity_ml_tx']
         valid_w_cols = [c for c in water_display_cols if c in df_water.columns]
@@ -1385,11 +1473,9 @@ def render_app():
         if df_ai_ins.empty:
             st.info("No AI telemetry found to generate benchmark insights.")
         else:
-            # Calculate water metrics for all AI rows
             df_ai_ins['WUE (L/kWh)'] = df_ai_ins['PROVIDER'].map(WUE_METRICS).fillna(WUE_METRICS["Unknown"])
             df_ai_ins['Water_Consumed_Liters'] = df_ai_ins['Energy Consumed - E (kWh)'] * df_ai_ins['WUE (L/kWh)']
             
-            # Group by the normalized AI model name
             model_stats = df_ai_ins.groupby('Join_Key').agg({
                 'Energy Consumed - E (kWh)': 'sum',
                 'Water_Consumed_Liters': 'sum',
@@ -1398,8 +1484,6 @@ def render_app():
                 'Estimated_Cost_$': 'sum'
             }).reset_index()
             
-            # FIX: Standardize the AI benchmark to "1,000 Tokens" per transaction to guarantee apples-to-apples.
-            # This prevents magnitude errors if a project logged raw tokens as Functional Units (like Galileo).
             model_stats['Benchmark_Denominator'] = np.where(
                 model_stats['Total_Tokens'] > 0, 
                 model_stats['Total_Tokens'] / 1000.0, 
@@ -1408,11 +1492,9 @@ def render_app():
 
             model_stats['Benchmark_Denominator'] = model_stats['Benchmark_Denominator'].replace(0, 1)
             
-            # Calculate strict intensity metrics (Wh per standard 1K prompt and ml per standard 1K prompt)
             model_stats['Energy_Intensity_Wh_tx'] = (model_stats['Energy Consumed - E (kWh)'] * 1000) / model_stats['Benchmark_Denominator']
             model_stats['Water_Intensity_ml_tx'] = (model_stats['Water_Consumed_Liters'] * 1000) / model_stats['Benchmark_Denominator']
             
-            # Filter valid interactions
             model_stats = model_stats[model_stats['Benchmark_Denominator'] > 0]
             
             if not model_stats.empty:
@@ -1431,7 +1513,6 @@ def render_app():
                             f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
                             unsafe_allow_html=True
                         )
-                        # Real world equivalent per 1000 requests
                         phones, km, w_val, w_unit, w_icon, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
                         with st.expander("🌍 Impact of 1,000 prompts"):
                             st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
@@ -1448,14 +1529,12 @@ def render_app():
                             f'<p style="color: #3498db; margin:0;"><b>{format_number(row.Water_Intensity_ml_tx)} ml/tx</b></p></div>', 
                             unsafe_allow_html=True
                         )
-                        # Real world equivalent per 1000 requests
                         phones, km, w_val, w_unit, w_icon, co2, water = get_equivalence_1000_prompts(row.Energy_Intensity_Wh_tx, row.Water_Intensity_ml_tx)
                         with st.expander("🌍 Impact of 1,000 prompts"):
                             st.caption(f"Generating 1,000 requests with this model emits **{co2:.2f} gCO₂e** and evaporates **{water:.2f} ml** of water.")
                             st.markdown(f"- 🔋 **{phones}** smartphone charges\n- 🚗 **{km:.1f}** km driven\n- {w_icon} **{w_val:.1f}** {w_unit}")
                 st.divider()
                 
-                # FULL RANKING TABLE WITH PROGRESS BARS
                 with st.expander("📊 View Full AI Models Ranking (Best to Worst)", expanded=False):
                     st.caption("All tested AI models sorted by architectural energy intensity (Wh per standard 1K-token transaction).")
                     
@@ -1505,6 +1584,128 @@ def render_app():
                     * **Infrastructure Geography:** Global benchmarks use average grid intensities. Our carbon footprint directly reflects the local grid where the container runs (e.g., AWS `ap-south-1`).
                     * **Embodied Carbon Allocation:** We strictly allocate the physical hardware's manufacturing footprint into our SCI metrics, whereas many public leaderboards only track operational electricity.
                     """)
+
+    # =====================================================================
+    # TAB 5: GREENOPS & AI SIMULATOR (CLEER METHODOLOGY)
+    # =====================================================================
+    with tab_simulator:
+        st.subheader("🧮 GreenOps & AI Simulator (CLEER v2.0)")
+        st.markdown(
+            "Simulate the environmental and financial impact of different architectures and *Prompt Caching* strategies "
+            "before running real code in production. This calculator exclusively uses the deterministic CLEER mathematical model, "
+            "avoiding calls to external APIs that introduce latency."
+        )
+
+        st.divider()
+
+        # 1. INPUT PARAMETERS (Numeric inputs for scale)
+        st.markdown("### 1. Transaction Parameters")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sim_prompt_tokens = st.number_input("Prompt Tokens (Input)", min_value=0, value=5000, step=500, help="Tokens sent to the model (uncached).")
+        with c2:
+            sim_completion_tokens = st.number_input("Completion Tokens (Output)", min_value=0, value=1000, step=100, help="Tokens generated by the model.")
+        with c3:
+            sim_cached_tokens = st.number_input("Cached Tokens (Read from Cache)", min_value=0, value=15000, step=1000, help="Tokens served from the provider's memory (e.g., Prompt Caching).")
+
+        st.write("")
+        c4, c5 = st.columns(2)
+        with c4:
+            sim_grid_intensity = st.number_input("Grid Intensity ($I$) in gCO₂e/kWh", min_value=0, value=350, step=10, help="Global average: 350. AWS us-east-1: ~400. AWS eu-north-1 (Sweden): ~12.")
+        with c5:
+            sim_pue = st.number_input("Data Center PUE", min_value=1.0, value=1.45, step=0.01, help="Power Usage Effectiveness. Global industry average: 1.45.")
+
+        # 2. CLEER MATH ENGINE (Live Calculations)
+        # CLEER Base Costs
+        COST_PROMPT_WH_1K = 0.32
+        COST_COMPLETION_WH_1K = 0.96
+        CACHE_DISCOUNT_FACTOR = 0.15 # 85% discount
+        COST_CACHE_WH_1K = COST_PROMPT_WH_1K * CACHE_DISCOUNT_FACTOR
+        
+        # --- BASELINE SCENARIO (No cache used, everything processed as Prompt) ---
+        base_prompt_e = ((sim_prompt_tokens + sim_cached_tokens) / 1000) * COST_PROMPT_WH_1K
+        base_comp_e = (sim_completion_tokens / 1000) * COST_COMPLETION_WH_1K
+        base_e_acc = base_prompt_e + base_comp_e
+        
+        # --- CLEER SCENARIO (With cache applied) ---
+        cleer_prompt_e = (sim_prompt_tokens / 1000) * COST_PROMPT_WH_1K
+        cleer_cache_e = (sim_cached_tokens / 1000) * COST_CACHE_WH_1K
+        cleer_comp_e = (sim_completion_tokens / 1000) * COST_COMPLETION_WH_1K
+        cleer_e_acc = cleer_prompt_e + cleer_cache_e + cleer_comp_e
+
+        def calculate_sci_cleer(e_acc, grid_i, pue):
+            # Step 2: Training amortization (Dev)
+            e_dev = e_acc * 1.5
+            # Step 3: Data Center Overhead (Fac) -> (GPU * CPU Uplift * Idle * PUE) + (Dev * CPU Uplift * PUE)
+            e_fac_wh = (e_acc * 1.5 * 1.1 * pue) + (e_dev * 1.5 * pue)
+            e_fac_kwh = e_fac_wh / 1000
+            # Step 4: Operational and Embodied Carbon (M) -> 90g GPU + 7g Facility = 97g/kWh CLEER standard
+            operational_carbon = e_fac_kwh * grid_i
+            embodied_carbon = e_fac_kwh * 97
+            total_carbon = operational_carbon + embodied_carbon
+            return total_carbon, e_fac_kwh
+
+        base_sci, base_kwh = calculate_sci_cleer(base_e_acc, sim_grid_intensity, sim_pue)
+        cleer_sci, cleer_kwh = calculate_sci_cleer(cleer_e_acc, sim_grid_intensity, sim_pue)
+
+        yield_pct = ((base_sci - cleer_sci) / base_sci) * 100 if base_sci > 0 else 0
+
+        # 3. LIVE RESULTS
+        st.divider()
+        st.markdown("### 2. Live Impact & GreenOps Yield")
+        
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.markdown(f'<div class="metric-card-danger"><h4>Theoretical SCI (No Cache)</h4><h2>{format_number(base_sci)} gCO₂e</h2></div>', unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="metric-card"><h4>Actual SCI (CLEER)</h4><h2>{format_number(cleer_sci)} gCO₂e</h2><p style="color: #27ae60; font-weight: bold;">Savings: {format_number(yield_pct)}%</p></div>', unsafe_allow_html=True)
+        with m3:
+            st.markdown(f'<div class="metric-card-ai"><h4>Total Tokens</h4><h2>{format_number(sim_prompt_tokens + sim_completion_tokens + sim_cached_tokens)}</h2></div>', unsafe_allow_html=True)
+
+        st.write("")
+        chart_data = pd.DataFrame({
+            'Scenario': ['Baseline (Unoptimized)', 'CLEER (Cache-Aware)'],
+            'Emissions (gCO₂e)': [base_sci, cleer_sci]
+        })
+        fig_sim = px.bar(
+            chart_data, x='Scenario', y='Emissions (gCO₂e)', color='Scenario',
+            title="Carbon Intensity Comparison (SCI)", text_auto='.2f',
+            color_discrete_map={'Baseline (Unoptimized)': '#e74c3c', 'CLEER (Cache-Aware)': '#2ecc71'}
+        )
+        st.plotly_chart(fig_sim, use_container_width=True)
+
+        # 4. TRANSPARENT EXPLANATION (Whitebox)
+        st.divider()
+        st.markdown("### 3. CLEER Methodology: Where do these numbers come from?")
+        st.info(
+            "The goal of CLEER (Corporate-Level Estimating of Emissions from AI) is to eliminate the 'black box' problem in AI APIs. "
+            "Below, we detail the step-by-step deterministic math applied to this simulation based on industry standards."
+        )
+
+        with st.expander("📚 View Formulas, Constants, and Assumptions", expanded=False):
+            st.markdown(f"""
+            **Step 1: Accelerator Energy ($E_{{acc}}$)**
+            We calculate the direct electrical effort of the GPUs to process the tokens.
+            *   **Prompt Tokens:** We assume **0.32 Wh** per 1,000 tokens. (Parallel processing for reading is efficient).
+            *   **Completion Tokens:** We assume **0.96 Wh** per 1,000 tokens. (Writing requires heavy auto-regressive calculations).
+            *   **Cached Tokens:** We apply an **85%** discount. Reading from the provider's memory costs only **0.048 Wh** per 1,000 tokens. This rewards optimized architectures.
+            *   *Active energy calculated in this simulation:* **{format_number(cleer_e_acc)} Wh**.
+
+            **Step 2: Development Amortization ($E_{{dev}}$)**
+            Training foundational models consumes GWhs. The specification requires applying a penalty to amortize this phase.
+            *   **Constant:** $E_{{dev}} = E_{{acc}} \\times 1.5$ (50% overhead on inference).
+
+            **Step 3: Data Center Overhead ($E_{{fac}}$)**
+            GPUs do not operate in a vacuum. There are host CPUs, memory, cooling, and idle servers waiting for requests.
+            *   **Formula:** $E_{{fac}} = (E_{{acc}} \\times 1.5 \\text{{ [CPU Uplift]}} \\times 1.1 \\text{{ [Idle]}} \\times PUE) + (E_{{dev}} \\times 1.5 \\text{{ [CPU Uplift]}} \\times PUE)$
+            *   **Assumed PUE:** {sim_pue} (Configured above).
+            *   *Total facility energy calculated:* **{format_number(cleer_kwh * 1000)} Wh**.
+
+            **Step 4: Final Carbon Footprint ($SCI$)**
+            We apply the official SCI equation from the Green Software Foundation: $SCI = (E \\times I) + M$
+            *   **Operational ($E \\times I$):** We multiply the total energy by the grid intensity ($I = {sim_grid_intensity} \\text{{ gCO}}_2\\text{{e/kWh}}$).
+            *   **Embodied ($M$):** For unidentified hardware, CLEER dictates using standard fallbacks: **90 gCO₂e/kWh** for GPU manufacturing and **7 gCO₂e/kWh** for data center infrastructure (Total: 97 g/kWh). If you provide the exact `instance_type` in production, we query the Boavizta API to replace this average with the actual server kg.
+            """)
 
 if __name__ == "__main__":
         render_app()
