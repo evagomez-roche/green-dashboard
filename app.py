@@ -629,7 +629,7 @@ def render_app():
                     c1.metric(label="Baseline SCI (If no cache was used)", value=f"{avg_baseline:.2f} g/tx")
                     # Normal color makes positive values green
                     c2.metric(label="CLEER SCI (Actual Final Score)", value=f"{avg_cleer:.2f} g/tx", delta=f"{avg_yield:.1f}% Yield", delta_color="normal")
-                    c3.metric(label="Tokens Served From Cache", value=f"{format_number(total_cache_tokens)}")
+                    c3.metric(label="Tokens Served From Cache", value=f"{total_cache_tokens:,.0f}")
                     
                     # Chart Baseline vs CLEER
                     cleer_chart_df = cleer_df.groupby('AI_MODEL_NAME').agg({
