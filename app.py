@@ -324,20 +324,41 @@ def process_dataframe(df):
         'FUNCTIONAL_UNIT_TX': 'Functional Unit - R (Transactions)',
         'PROJECT_NAME': 'Project'
     })
-    
+
     df['Operational_Emissions_gCO2e'] = df['Total Carbon Footprint (g CO2e)']
 
-    # Manejo seguro de nuevas columnas v2.0 (CLEER) para no romper datos antiguos
     for col in ['CACHED_TOKENS', 'BASELINE_SCI_GCO2E', 'CLEER_SCI_GCO2E', 'OPTIMIZATION_YIELD_PCT']:
         if col not in df.columns:
             df[col] = 0.0 if col != 'CACHED_TOKENS' else 0
         else:
             df[col] = df[col].fillna(0)
 
-    # El Total de Tokens ahora debe incluir la caché para reflejar el coste del payload real
     df['Total_Tokens'] = df['PROMPT_TOKENS'] + df['COMPLETION_TOKENS'] + df['CACHED_TOKENS']
     df['Estimated_Cost_$'] = df['Total_Tokens'] * df['Cost_Per_Token']
     df['Estimated_Cost_$'] = df['Estimated_Cost_$'].fillna(0.0)
+
+    # ==========================================
+    # NUEVO: EXTRAER ENTORNO DINÁMICAMENTE (ROBUSTO)
+    # ==========================================
+    def extract_env(row):
+        proj_name = str(row.get('Project', 'Unknown'))
+        
+        # 1. Si el nombre tiene el sufijo explícito (ej: "PDFParser - Local")
+        if ' - ' in proj_name:
+            parts = proj_name.split(' - ')
+            return parts[1].strip(), parts[0].strip()
+            
+        # 2. Si no tiene sufijo (como tu ArxivSummarizer), lo deducimos del sensor de hardware
+        sensor = str(row.get('MEASUREMENT_METHOD', '')).lower()
+        if 'rapl' in sensor:
+            return 'Jupyter', proj_name
+        elif 'tdp' in sensor:
+            return 'Local', proj_name
+            
+        return 'Unknown', proj_name
+
+    # Aplicamos la función a nivel de fila completa (axis=1) para poder leer el sensor
+    df[['ENVIRONMENT', 'Project']] = df.apply(lambda row: pd.Series(extract_env(row)), axis=1)
 
     return df
 
@@ -411,7 +432,7 @@ def render_app():
         st.warning("No data available for the selected project filters.")
         st.stop()
 
-    filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZATION)', regex=False)
+    filtered_df['Is_Post'] = filtered_df['PROCESS_DESC'].str.contains('(POST-OPTIMIZATION)', regex=False) | filtered_df['PROCESS_DESC'].str.lower().str.contains('post_', regex=False) | filtered_df['FUNCTIONAL_UNIT_NAME'].str.lower().str.contains('post_', regex=False, na=False)
 
     # =====================================================================
     # TABS SETUP
@@ -651,7 +672,14 @@ def render_app():
             # =====================================================================
             # PRE VS POST OPTIMIZATION SAVINGS MODULE
             # =====================================================================
-            df_proj['Clean_Step'] = df_proj['PROCESS_DESC'].str.replace(' (POST-OPTIMIZATION)', '', regex=False)
+            def clean_step_for_trajectory(row):
+                desc = str(row.get('PROCESS_DESC', '')).lower()
+                fun_name = str(row.get('FUNCTIONAL_UNIT_NAME', '')).lower()
+                target = fun_name if ('summarize' in fun_name or 'parser' in fun_name) else desc
+                # Eliminamos todos los prefijos, sufijos y extensiones para igualar los pasos
+                return target.replace('pre_', '').replace('post_', '').replace('.py', '').replace(' [ai]', '').replace(' [standard]', '').replace(' (post-optimization)', '').strip()
+                
+            df_proj['Clean_Step'] = df_proj.apply(clean_step_for_trajectory, axis=1)
             df_proj['Status'] = np.where(df_proj['Is_Post'], 'Post-Optimization', 'Baseline')
             
             if df_proj['Is_Post'].any():
@@ -681,6 +709,7 @@ def render_app():
                         'Phase': ['Baseline', 'Post-Optimization'],
                         'Carbon Footprint (gCO2e)': [pre_carbon_total, post_carbon_total]
                     })
+                    
                     if is_ai_proj:
                         pre_cost_total = df_pre['Estimated_Cost_$'].sum()
                         post_cost_total = df_post['Estimated_Cost_$'].sum()
@@ -993,6 +1022,84 @@ def render_app():
                     color_discrete_sequence=DARK_BLUES
                 )
                 st.plotly_chart(fig_drill_cost, use_container_width=True)
+
+            # =====================================================================
+            # CROSS-ENVIRONMENT COMPARISON MODULE (CLOUD VS LOCAL)
+            # =====================================================================
+            if 'ENVIRONMENT' in df_proj.columns:
+                unique_envs = [e for e in df_proj['ENVIRONMENT'].unique() if pd.notna(e) and str(e).lower() != 'unknown']
+                
+                if len(unique_envs) > 1:
+                    st.divider()
+                    st.subheader("⚖️ Cross-Environment Infrastructure Benchmark")
+                    st.markdown("This module isolates and compares footprint deviations triggered exclusively by the deployment infrastructure (e.g., Cloud Cluster vs Local Hardware) across identical workloads.")
+                    
+                    env_phase = st.selectbox("Select Phase to Benchmark:", ["Baseline", "Post-Optimization"], key="cross_env_phase")
+                    df_env_phase = df_proj[df_proj['Status'] == env_phase].copy()
+                    
+                    if not df_env_phase.empty:
+                        ref_env = 'Local' if 'Local' in unique_envs else unique_envs[0]
+                        comp_env = [e for e in unique_envs if e != ref_env][0]
+                        
+                        st.caption(f"Comparing **{comp_env}** against **{ref_env}** baseline.")
+                        
+                        def standardize_step_name(row):
+                            desc = str(row.get('PROCESS_DESC', '')).lower()
+                            fun_name = str(row.get('FUNCTIONAL_UNIT_NAME', '')).lower()
+                            target = fun_name if ('summarize' in fun_name or 'parser' in fun_name) else desc
+                            return target.replace('pre_', '').replace('post_', '').replace('.py [ai]', '').replace('.py [standard]', '').replace(' (post-optimization)', '').strip()
+                            
+                        df_env_phase['Cross_Step'] = df_env_phase.apply(standardize_step_name, axis=1)
+                        
+                        df_ref = df_env_phase[df_env_phase['ENVIRONMENT'] == ref_env]
+                        df_comp = df_env_phase[df_env_phase['ENVIRONMENT'] == comp_env]
+                        
+                        common_steps = set(df_ref['Cross_Step']).intersection(set(df_comp['Cross_Step']))
+                        bench_data = []
+                        
+                        for step in common_steps:
+                            tx_ref = df_ref[df_ref['Cross_Step'] == step]['Functional Unit - R (Transactions)'].sum()
+                            sci_ref = df_ref[df_ref['Cross_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum() / tx_ref if tx_ref > 0 else 0
+                            
+                            tx_comp = df_comp[df_comp['Cross_Step'] == step]['Functional Unit - R (Transactions)'].sum()
+                            sci_comp = df_comp[df_comp['Cross_Step'] == step]['Total Carbon Footprint (g CO2e)'].sum() / tx_comp if tx_comp > 0 else 0
+                            
+                            variance = sci_comp / sci_ref if sci_ref > 0 else 0
+                            var_text = f"{comp_env} emits {variance:.1f}x MORE" if variance > 1.05 else (f"{comp_env} emits {1/variance:.1f}x LESS" if 0 < variance < 0.95 else "Parity (~1.0x)")
+                            
+                            bench_data.append({
+                                'Component / Step': step,
+                                f'{ref_env} SCI (gCO₂e)': sci_ref,
+                                f'{comp_env} SCI (gCO₂e)': sci_comp,
+                                'Infrastructure Variance': var_text
+                            })
+                            
+                        tot_tx_ref = df_ref['Functional Unit - R (Transactions)'].sum()
+                        tot_sci_ref = df_ref['Total Carbon Footprint (g CO2e)'].sum() / tot_tx_ref if tot_tx_ref > 0 else 0
+                        
+                        tot_tx_comp = df_comp['Functional Unit - R (Transactions)'].sum()
+                        tot_sci_comp = df_comp['Total Carbon Footprint (g CO2e)'].sum() / tot_tx_comp if tot_tx_comp > 0 else 0
+                        
+                        tot_var = tot_sci_comp / tot_sci_ref if tot_sci_ref > 0 else 0
+                        tot_var_text = f"{comp_env} emits {tot_var:.1f}x MORE" if tot_var > 1.05 else (f"{comp_env} emits {1/tot_var:.1f}x LESS" if 0 < tot_var < 0.95 else "Parity (~1.0x)")
+                        
+                        bench_data.append({
+                            'Component / Step': 'TOTAL PROJECT PIPELINE',
+                            f'{ref_env} SCI (gCO₂e)': tot_sci_ref,
+                            f'{comp_env} SCI (gCO₂e)': tot_sci_comp,
+                            'Infrastructure Variance': tot_var_text
+                        })
+                        
+                        bench_df = pd.DataFrame(bench_data)
+                        st.dataframe(format_dataframe_display(bench_df), use_container_width=True)
+                        
+                        with st.expander("🔍 Interpret Infrastructure Variance", expanded=True):
+                            if is_ai_proj:
+                                st.markdown("**Key Finding: Why is the carbon footprint identical (1.0x) between Cloud and Local in the AI execution?**\n\nUnlike the PDF Parser, both our Cloud server and Local PC showed the exact same carbon footprint for the AI tasks.\n- **The Reason:** We used the CLEER methodology. When we use GenAI APIs, 99.9% of the computational effort and energy consumption happens inside Google's massive data centers, not on our machines.\n- Whether we run the script on a heavy cloud server or a small laptop, our machine is simply keeping a network connection open, waiting for Google to send the answer back. The energy used to 'wait' is practically zero compared to the energy used by the AI to generate the text.\n- **Takeaway:** To decarbonize AI applications, changing our local hardware or cloud infrastructure is useless. The only way to reduce AI emissions is by optimizing how we talk to the model (sending fewer tokens, using lighter models, and caching responses).")
+                            else:
+                                st.markdown("**Key Finding: Why did the Cloud appear to emit ~200x more carbon than the Local PC?**\n\nThis is a measurement reality, not an error.\n1. **Sensors:** In our Linux Cloud, we have access to highly accurate hardware sensors (Intel RAPL) that measure the whole CPU and RAM. Windows blocks this access, forcing the local tool to 'guess' the power based only on active CPU cores (TDP Heuristic), missing a lot of data.\n2. **Server Baseline:** A massive enterprise cloud server consumes a lot of baseline power (150W-300W) just to stay turned on, whereas a local laptop idles at very low power (2W-10W).\n- **Takeaway:** For traditional software, we cannot directly compare raw emissions between completely different hardware. The success metric is the percentage of reduction achieved within the same environment.")
+                    else:
+                        st.info(f"No comparison possible yet. You need both Local and {comp_env} data for the '{env_phase}' phase.")
 
     # =====================================================================
     # TAB 2: GLOBAL OVERVIEW
